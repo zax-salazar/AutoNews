@@ -1,7 +1,7 @@
 import html
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup, Tag, Comment
 import requests
 
@@ -10,23 +10,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_USER_AGENT = "AutoNews/1.0"
 MIN_CONTENT_LENGTH = 100
 
-# Non-content tags to strip before extraction
-UNWANTED_TAGS = [
-    "script",
-    "style",
-    "noscript",
-    "nav",
-    "footer",
-    "header",
-    "aside",
-    "form",
-    "iframe",
-    "svg",
-]
-
-# Patterns for elements to decompose (e.g., ads, comments, navigation)
+# Patterns for elements/classes/ids to decompose (e.g., ads, comments, social shares, widgets)
 UNWANTED_CLASSES_IDS = re.compile(
-    r"(?:^|[\-_])(?:ad|ads|advertisement|banner|sidebar|comments|related|social|share|nav|menu|footer|header)(?:[\-_]|$)",
+    r"(?:^|[\-_])(?:ad|ads|advertisement|banner|sidebar|comments|related|social|share|nav|menu|footer|header|cookie|consent|newsletter|recommendation|widget)(?:[\-_]|$)",
     re.IGNORECASE,
 )
 
@@ -36,8 +22,26 @@ ARTICLE_CONTAINER_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Semantic block-level HTML tags for text extraction
-LEAF_BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "dt", "dd"}
+# Subtitle / dek / standfirst container patterns
+DEK_PATTERNS = re.compile(
+    r"(?:^|[\-_])(?:dek|subtitle|standfirst|lead|summary|excerpt)(?:[\-_]|$)",
+    re.IGNORECASE,
+)
+
+# Patterns for filtering unwanted images (tracking pixels, avatars, icons, logos, ads)
+UNWANTED_IMAGE_PATTERNS = re.compile(
+    r"(?:pixel|spacer|blank|tracking|avatar|logo|icon|social|button|ad|banner|analytics|1x1)",
+    re.IGNORECASE,
+)
+
+# Video provider patterns
+VIDEO_URL_PATTERNS = re.compile(
+    r"(?:youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|twitch\.tv|player\.|video)",
+    re.IGNORECASE,
+)
+
+# Block-level tags for DOM traversal
+BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "figure", "img", "video", "iframe", "blockquote", "li"}
 
 
 def fetch_article_html(url: str, timeout: int = 10) -> Optional[str]:
@@ -67,46 +71,230 @@ def fetch_article_html(url: str, timeout: int = 10) -> Optional[str]:
         return None
 
 
-def _clean_soup(soup: BeautifulSoup) -> None:
+def _clean_text(text: Optional[str]) -> Optional[str]:
+    """Strip whitespace, unescape HTML entities, and collapse internal spaces."""
+    if not text:
+        return None
+    cleaned = html.unescape(text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if cleaned else None
+
+
+def _extract_title(soup: BeautifulSoup, container: Optional[Tag]) -> Tuple[Optional[str], bool]:
+    """Extract page/article title.
+
+    Returns:
+        tuple: (title_str | None, is_high_confidence_h1: bool)
+    """
+    # 1. High-confidence H1 inside article container or soup
+    h1 = container.find("h1") if container else soup.find("h1")
+    if h1 and isinstance(h1, Tag):
+        h1_text = _clean_text(h1.get_text())
+        if h1_text and len(h1_text) >= 3:
+            return h1_text, True
+
+    # 2. Open Graph or Twitter title meta tags
+    og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
+    if og_title and isinstance(og_title, Tag):
+        meta_content = _clean_text(og_title.get("content"))
+        if meta_content:
+            return meta_content, False
+
+    # 3. HTML <title> tag
+    title_tag = soup.find("title")
+    if title_tag and isinstance(title_tag, Tag):
+        page_title = _clean_text(title_tag.get_text())
+        if page_title:
+            return page_title, False
+
+    return None, False
+
+
+def _extract_description(
+    soup: BeautifulSoup, container: Optional[Tag], fallback_summary: Optional[str] = None
+) -> Optional[str]:
+    """Extract article description/subtitle/introduction."""
+    # 1. Dek / Subtitle / Standfirst inside container
+    if container:
+        dek_tag = container.find(
+            lambda tag: isinstance(tag, Tag)
+            and tag.attrs is not None
+            and tag.name in ("p", "div", "header", "h2", "span")
+            and (
+                DEK_PATTERNS.search(" ".join(tag.get("class", [])) if isinstance(tag.get("class"), list) else tag.get("class", ""))
+                or DEK_PATTERNS.search(tag.get("id") or "")
+            )
+        )
+        if dek_tag and isinstance(dek_tag, Tag):
+            dek_text = _clean_text(dek_tag.get_text())
+            if dek_text:
+                return dek_text
+
+    # 2. Meta tags (og:description, description, twitter:description)
+    meta_desc = (
+        soup.find("meta", property="og:description")
+        or soup.find("meta", attrs={"name": "description"})
+        or soup.find("meta", attrs={"name": "twitter:description"})
+    )
+    if meta_desc and isinstance(meta_desc, Tag):
+        content = _clean_text(meta_desc.get("content"))
+        if content:
+            return content
+
+    # 3. Fallback to RSS summary if available
+    if fallback_summary:
+        cleaned_summary = _clean_text(fallback_summary)
+        if cleaned_summary:
+            return cleaned_summary
+
+    return None
+
+
+def _resolve_image_url(img_tag: Tag) -> Optional[str]:
+    """Extract best image URL from <img> attributes (supporting lazy loading and srcset)."""
+    if img_tag.attrs is None:
+        return None
+
+    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+        val = img_tag.get(attr)
+        if val and isinstance(val, str) and not val.startswith("data:image/"):
+            return val.strip()
+
+    srcset = img_tag.get("srcset")
+    if srcset and isinstance(srcset, str):
+        candidates = [c.strip().split()[0] for c in srcset.split(",") if c.strip()]
+        valid_candidates = [c for c in candidates if not c.startswith("data:image/")]
+        if valid_candidates:
+            return valid_candidates[-1]
+
+    return None
+
+
+def _is_valid_image(img_tag: Tag, url: Optional[str]) -> bool:
+    """Validate whether an image is a genuine article image rather than logo/icon/ad."""
+    if not url or not isinstance(url, str):
+        return False
+
+    if url.startswith("data:image/"):
+        return False
+
+    if UNWANTED_IMAGE_PATTERNS.search(url):
+        return False
+
+    if img_tag.attrs is not None:
+        classes = img_tag.get("class")
+        class_str = " ".join(classes) if isinstance(classes, list) else (classes or "")
+        tag_id = img_tag.get("id") or ""
+        if UNWANTED_IMAGE_PATTERNS.search(class_str) or UNWANTED_IMAGE_PATTERNS.search(tag_id):
+            return False
+
+        width = img_tag.get("width")
+        height = img_tag.get("height")
+        if width and str(width).strip() in ("1", "0"):
+            return False
+        if height and str(height).strip() in ("1", "0"):
+            return False
+
+    return True
+
+
+def _extract_image_block(img_tag: Tag, parent_figure: Optional[Tag] = None) -> Optional[Dict[str, Any]]:
+    """Extract structured image block dictionary."""
+    url = _resolve_image_url(img_tag)
+    if not _is_valid_image(img_tag, url):
+        return None
+
+    alt = _clean_text(img_tag.get("alt")) if img_tag.attrs else None
+
+    caption = None
+    if parent_figure and parent_figure.attrs is not None:
+        figcaption = parent_figure.find("figcaption")
+        if figcaption and isinstance(figcaption, Tag):
+            caption = _clean_text(figcaption.get_text())
+
+    if not caption and img_tag.attrs is not None:
+        caption = _clean_text(img_tag.get("title"))
+
+    return {
+        "type": "image",
+        "url": url,
+        "alt": alt,
+        "caption": caption,
+    }
+
+
+def _extract_video_block(tag: Tag) -> Optional[Dict[str, Any]]:
+    """Extract structured video block dictionary from <video> or <iframe> tag."""
+    if tag.attrs is None:
+        return None
+
+    video_url = None
+    title = None
+
+    if tag.name == "video":
+        src = tag.get("src")
+        if not src:
+            source = tag.find("source")
+            if source and isinstance(source, Tag) and source.attrs:
+                src = source.get("src")
+        if src and isinstance(src, str):
+            video_url = src.strip()
+        title = _clean_text(tag.get("title") or tag.get("aria-label"))
+
+    elif tag.name == "iframe":
+        src = tag.get("src") or tag.get("data-src")
+        if src and isinstance(src, str):
+            src = src.strip()
+            if VIDEO_URL_PATTERNS.search(src):
+                video_url = src
+                title = _clean_text(tag.get("title") or tag.get("aria-label"))
+
+    if not video_url:
+        return None
+
+    return {
+        "type": "video",
+        "url": video_url,
+        "title": title,
+    }
+
+
+def _clean_soup_for_extraction(soup: BeautifulSoup) -> None:
     """Decompose non-content tags, comments, and obvious ad/nav containers in place."""
     # Remove HTML comments
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
         comment.extract()
 
-    # Remove unwanted tags
-    for tag in soup.find_all(UNWANTED_TAGS):
+    # Decompose unwanted tags
+    for tag in soup.find_all(["script", "style", "noscript", "nav", "footer", "aside", "form", "svg"]):
         tag.decompose()
 
-    # Remove elements with unwanted classes or IDs
+    # Decompose header tags only if not inside an article
+    for header_tag in soup.find_all("header"):
+        if not header_tag.find_parent("article"):
+            header_tag.decompose()
+
+    # Decompose unwanted containers by class/id
     for tag in soup.find_all(True):
-        if not isinstance(tag, Tag):
+        if not isinstance(tag, Tag) or tag.attrs is None:
             continue
         classes = tag.get("class")
         class_str = " ".join(classes) if isinstance(classes, list) else (classes or "")
         tag_id = tag.get("id") or ""
 
         if UNWANTED_CLASSES_IDS.search(class_str) or UNWANTED_CLASSES_IDS.search(tag_id):
-            # Avoid decomposing main article containers or body
-            if tag.name not in ("body", "main", "article"):
+            if tag.name not in ("body", "main", "article", "header"):
                 tag.decompose()
 
 
 def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
-    """Find the best article container using prioritized heuristics.
-
-    Priority:
-    1. Explicit <article> tag or tags with specific article class/ID patterns.
-    2. <main> tag.
-    3. <body> tag.
-    """
-    # 1. Look for <article> tag
+    """Find the best article container using prioritized heuristics."""
     article_tag = soup.find("article")
     if article_tag and isinstance(article_tag, Tag):
         return article_tag
 
-    # 1b. Search for explicit article classes/IDs
     for tag in soup.find_all(True):
-        if not isinstance(tag, Tag):
+        if not isinstance(tag, Tag) or tag.attrs is None:
             continue
         classes = tag.get("class")
         class_str = " ".join(classes) if isinstance(classes, list) else (classes or "")
@@ -115,12 +303,10 @@ def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
         if ARTICLE_CONTAINER_PATTERNS.search(class_str) or ARTICLE_CONTAINER_PATTERNS.search(tag_id):
             return tag
 
-    # 2. Fall back to <main>
     main_tag = soup.find("main")
     if main_tag and isinstance(main_tag, Tag):
         return main_tag
 
-    # 3. Fall back to <body>
     body_tag = soup.body
     if body_tag and isinstance(body_tag, Tag):
         return body_tag
@@ -128,56 +314,122 @@ def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
     return None
 
 
-def _format_container_text(container: Tag) -> str:
-    """Extract clean text from a container, preserving paragraph breaks."""
-    paragraphs: List[str] = []
+def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
+    """Extract structured, DOM-ordered blocks (paragraphs, headings, images, videos) from container."""
+    blocks: List[Dict[str, Any]] = []
+    processed_elements = set()
+    seen_media_urls = set()
 
-    # Find block elements in container
-    candidate_blocks = container.find_all(LEAF_BLOCK_TAGS)
+    elements = container.find_all(BLOCK_TAGS)
 
-    # Filter to leaf block tags (block tags that do not contain child block tags)
-    leaf_blocks: List[Tag] = []
-    for block in candidate_blocks:
-        if isinstance(block, Tag):
-            has_child_block = any(
-                isinstance(child, Tag) and child.name in LEAF_BLOCK_TAGS
-                for child in block.find_all(True)
-            )
-            if not has_child_block:
-                leaf_blocks.append(block)
+    for element in elements:
+        if not isinstance(element, Tag) or element.attrs is None:
+            continue
 
-    if leaf_blocks:
-        for block in leaf_blocks:
-            text = block.get_text(" ", strip=True)
-            cleaned_text = html.unescape(re.sub(r"\s+", " ", text).strip())
-            if cleaned_text:
-                if not paragraphs or paragraphs[-1] != cleaned_text:
-                    paragraphs.append(cleaned_text)
+        if element in processed_elements:
+            continue
 
-    # Fall back if no leaf blocks were found or if they produced no text
-    if not paragraphs:
+        ancestors = list(element.parents)
+        if any(anc in processed_elements for anc in ancestors):
+            continue
+
+        tag_name = element.name
+
+        # 1. Headings
+        if tag_name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            level = int(tag_name[1])
+            heading_text = _clean_text(element.get_text())
+            if heading_text:
+                blocks.append({"type": "heading", "level": level, "content": heading_text})
+            processed_elements.add(element)
+
+        # 2. Figure containers
+        elif tag_name == "figure":
+            img = element.find("img")
+            if img and isinstance(img, Tag) and img.attrs is not None:
+                img_block = _extract_image_block(img, parent_figure=element)
+                if img_block and img_block["url"] not in seen_media_urls:
+                    seen_media_urls.add(img_block["url"])
+                    blocks.append(img_block)
+            else:
+                video = element.find(["video", "iframe"])
+                if video and isinstance(video, Tag) and video.attrs is not None:
+                    video_block = _extract_video_block(video)
+                    if video_block and video_block["url"] not in seen_media_urls:
+                        seen_media_urls.add(video_block["url"])
+                        blocks.append(video_block)
+
+            processed_elements.add(element)
+            for child in element.find_all(True):
+                processed_elements.add(child)
+
+        # 3. Standalone Image
+        elif tag_name == "img":
+            img_block = _extract_image_block(element)
+            if img_block and img_block["url"] not in seen_media_urls:
+                seen_media_urls.add(img_block["url"])
+                blocks.append(img_block)
+            processed_elements.add(element)
+
+        # 4. Standalone Video or Iframe
+        elif tag_name in ("video", "iframe"):
+            video_block = _extract_video_block(element)
+            if video_block and video_block["url"] not in seen_media_urls:
+                seen_media_urls.add(video_block["url"])
+                blocks.append(video_block)
+            processed_elements.add(element)
+
+        # 5. Paragraphs, Blockquotes, List items
+        elif tag_name in ("p", "blockquote", "li"):
+            nested_imgs = element.find_all("img")
+            nested_videos = element.find_all(["video", "iframe"])
+
+            p_text = _clean_text(element.get_text())
+            if p_text:
+                if not blocks or blocks[-1].get("content") != p_text:
+                    blocks.append({"type": "paragraph", "content": p_text})
+
+            processed_elements.add(element)
+
+            for img in nested_imgs:
+                if isinstance(img, Tag) and img.attrs is not None and img not in processed_elements:
+                    img_block = _extract_image_block(img)
+                    if img_block and img_block["url"] not in seen_media_urls:
+                        seen_media_urls.add(img_block["url"])
+                        blocks.append(img_block)
+                    processed_elements.add(img)
+
+            for vid in nested_videos:
+                if isinstance(vid, Tag) and vid.attrs is not None and vid not in processed_elements:
+                    video_block = _extract_video_block(vid)
+                    if video_block and video_block["url"] not in seen_media_urls:
+                        seen_media_urls.add(video_block["url"])
+                        blocks.append(video_block)
+                    processed_elements.add(vid)
+
+    if not blocks:
         raw_text = container.get_text("\n")
         for line in raw_text.splitlines():
-            cleaned_line = html.unescape(re.sub(r"\s+", " ", line).strip())
+            cleaned_line = _clean_text(line)
             if cleaned_line:
-                if not paragraphs or paragraphs[-1] != cleaned_line:
-                    paragraphs.append(cleaned_line)
+                blocks.append({"type": "paragraph", "content": cleaned_line})
 
-    return "\n\n".join(paragraphs)
+    return blocks
 
 
-def extract_article_content(html_content: str) -> Optional[str]:
-    """Extract main article text content from HTML string.
+def extract_article_data(html_content: str, fallback_summary: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Extract structured article data (title, description, content, blocks) from HTML string.
 
     Parameters:
         html_content (str): The raw HTML string.
+        fallback_summary (str, optional): RSS summary to use as description fallback.
 
     Returns:
-        str | None: Cleaned article text with paragraph separation,
+        dict | None: Dictionary with 'title', 'description', 'content', and 'blocks',
             or None if extraction fails or content length is below threshold.
     """
     if not html_content or not isinstance(html_content, str) or not html_content.strip():
-        logger.warning("Empty or invalid HTML content passed to extract_article_content.")
+        logger.warning("Empty or invalid HTML content passed to extract_article_data.")
         return None
 
     try:
@@ -186,17 +438,26 @@ def extract_article_content(html_content: str) -> Optional[str]:
         logger.error("Failed to parse HTML with BeautifulSoup: %s", exc)
         return None
 
-    _clean_soup(soup)
+    _clean_soup_for_extraction(soup)
 
     container = _find_article_container(soup)
     if not container:
         logger.warning("No suitable article container found in HTML.")
         return None
 
-    extracted_text = _format_container_text(container)
+    title, is_high_confidence_h1 = _extract_title(soup, container)
+    description = _extract_description(soup, container, fallback_summary=fallback_summary)
 
-    # Calculate non-whitespace character count
-    non_ws_count = len(re.sub(r"\s+", "", extracted_text))
+    blocks = _extract_blocks(container)
+
+    text_parts = [
+        block["content"]
+        for block in blocks
+        if block["type"] in ("paragraph", "heading") and "content" in block
+    ]
+    content_text = "\n\n".join(text_parts)
+
+    non_ws_count = len(re.sub(r"\s+", "", content_text))
     if non_ws_count < MIN_CONTENT_LENGTH:
         logger.warning(
             "Extracted content length (%d non-ws chars) is below minimum threshold (%d).",
@@ -205,19 +466,39 @@ def extract_article_content(html_content: str) -> Optional[str]:
         )
         return None
 
-    return extracted_text
+    return {
+        "title": title,
+        "is_high_confidence_h1": is_high_confidence_h1,
+        "description": description,
+        "content": content_text,
+        "blocks": blocks,
+    }
+
+
+def extract_article_content(html_content: str) -> Optional[str]:
+    """Extract main article text content from HTML string (backward compatible function).
+
+    Parameters:
+        html_content (str): The raw HTML string.
+
+    Returns:
+        str | None: Cleaned article text with paragraph separation,
+            or None if extraction fails or content length is below threshold.
+    """
+    data = extract_article_data(html_content)
+    return data["content"] if data else None
 
 
 def extract_article(article: dict, timeout: int = 10) -> Optional[Dict[str, Any]]:
-    """Fetch and extract article text for a single article dictionary.
+    """Fetch and extract structured article data for a single article dictionary.
 
     Parameters:
         article (dict): Article metadata dictionary (must contain 'url').
         timeout (int): HTTP timeout in seconds.
 
     Returns:
-        dict | None: A copy of the input dictionary with an added 'content' field,
-            or None if fetching/extraction fails.
+        dict | None: A copy of the input dictionary updated with 'content', 'blocks',
+            'description', and high-confidence 'title', or None if extraction fails.
     """
     if not isinstance(article, dict):
         logger.warning("Invalid article type passed to extract_article: %r", article)
@@ -233,14 +514,19 @@ def extract_article(article: dict, timeout: int = 10) -> Optional[Dict[str, Any]
         logger.warning("Failed to fetch HTML for article URL: %s", url)
         return None
 
-    content = extract_article_content(html_content)
-    if not content:
+    data = extract_article_data(html_content, fallback_summary=article.get("summary"))
+    if not data:
         logger.warning("Failed to extract content for article URL: %s", url)
         return None
 
-    # Return a copy with new 'content' field
     result = dict(article)
-    result["content"] = content
+    result["content"] = data["content"]
+    result["blocks"] = data["blocks"]
+    result["description"] = data["description"]
+
+    if data["is_high_confidence_h1"] and data["title"]:
+        result["title"] = data["title"]
+
     return result
 
 

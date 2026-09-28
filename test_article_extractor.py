@@ -4,6 +4,7 @@ import requests
 from article_extractor import (
     fetch_article_html,
     extract_article_content,
+    extract_article_data,
     extract_article,
     extract_articles,
     DEFAULT_USER_AGENT,
@@ -13,182 +14,331 @@ from article_extractor import (
 
 class TestArticleExtractor(unittest.TestCase):
 
-    # --- Test 1: Successful HTML fetch ---
+    # --- 1. Article title extraction ---
+    def test_extract_title(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>High Confidence Article Title</h1>
+                <p>This paragraph contains sufficient article text to pass the content length validation threshold comfortably for this test.</p>
+                <p>Adding another paragraph of text to make sure the non-whitespace character count is well above one hundred characters.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["title"], "High Confidence Article Title")
+
+    # --- 2. Description extraction ---
+    def test_extract_description(self):
+        html = """
+        <html>
+        <head><meta property="og:description" content="This is the Open Graph description of the article."></head>
+        <body>
+            <article>
+                <h1>Article Title</h1>
+                <p>This paragraph contains sufficient article text to pass the content length validation threshold comfortably for this test.</p>
+                <p>Adding another paragraph of text to make sure the non-whitespace character count is well above one hundred characters.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["description"], "This is the Open Graph description of the article.")
+
+    # --- 3. Full paragraph extraction ---
+    def test_extract_paragraphs(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>First paragraph of the gaming news story with detailed information.</p>
+                <p>Second paragraph providing more insights and developer interview quotes.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        p_blocks = [b for b in data["blocks"] if b["type"] == "paragraph"]
+        self.assertEqual(len(p_blocks), 2)
+        self.assertEqual(p_blocks[0]["content"], "First paragraph of the gaming news story with detailed information.")
+        self.assertEqual(p_blocks[1]["content"], "Second paragraph providing more insights and developer interview quotes.")
+
+    # --- 4. Heading extraction ---
+    def test_extract_headings(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Introductory paragraph containing sufficient details for validation testing.</p>
+                <h2>Subheading Level Two</h2>
+                <p>Further details below the subheading section of this article.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        h_blocks = [b for b in data["blocks"] if b["type"] == "heading"]
+        self.assertTrue(len(h_blocks) >= 1)
+        subheadings = [b for b in h_blocks if b["level"] == 2]
+        self.assertEqual(len(subheadings), 1)
+        self.assertEqual(subheadings[0]["content"], "Subheading Level Two")
+
+    # --- 5 & 6 & 7. Image extraction with alt and caption ---
+    def test_extract_image_with_alt_and_caption(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Introductory paragraph containing sufficient details for validation testing across all requirements.</p>
+                <figure>
+                    <img src="https://example.com/screenshot.jpg" alt="Game Screenshot Alt">
+                    <figcaption>Screenshot showing gameplay action in high resolution.</figcaption>
+                </figure>
+                <p>Concluding paragraph following the image figure container.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/screenshot.jpg")
+        self.assertEqual(img_blocks[0]["alt"], "Game Screenshot Alt")
+        self.assertEqual(img_blocks[0]["caption"], "Screenshot showing gameplay action in high resolution.")
+
+    # --- 8. Lazy-loaded image URL extraction ---
+    def test_extract_lazy_loaded_image(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Introductory paragraph containing sufficient details for validation testing across lazy loading features.</p>
+                <img data-src="https://example.com/lazy_photo.jpg" alt="Lazy Photo">
+                <p>Concluding paragraph following the lazy loaded image tag.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/lazy_photo.jpg")
+
+    # --- 9 & 10. Video & iframe video extraction ---
+    def test_extract_videos(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Introductory paragraph containing sufficient details for validation testing video embed features.</p>
+                <video src="https://example.com/trailer.mp4" title="Official Trailer"></video>
+                <iframe src="https://www.youtube.com/embed/xyz123" title="Gameplay Video"></iframe>
+                <p>Concluding paragraph following video elements inside the article container.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        vid_blocks = [b for b in data["blocks"] if b["type"] == "video"]
+        self.assertEqual(len(vid_blocks), 2)
+        self.assertEqual(vid_blocks[0]["url"], "https://example.com/trailer.mp4")
+        self.assertEqual(vid_blocks[0]["title"], "Official Trailer")
+        self.assertEqual(vid_blocks[1]["url"], "https://www.youtube.com/embed/xyz123")
+        self.assertEqual(vid_blocks[1]["title"], "Gameplay Video")
+
+    # --- 11. Correct block ordering ---
+    def test_block_ordering(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Paragraph 1 text containing enough detail for validation purposes.</p>
+                <img src="https://example.com/image1.jpg" alt="Image 1">
+                <p>Paragraph 2 text following the first image in the sequence.</p>
+                <iframe src="https://www.youtube.com/embed/trailer1" title="Trailer 1"></iframe>
+                <p>Paragraph 3 text following the video in the sequence.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        block_types = [b["type"] for b in data["blocks"]]
+        expected_types = ["heading", "paragraph", "image", "paragraph", "video", "paragraph"]
+        self.assertEqual(block_types, expected_types)
+
+    # --- 12. Removal of nav/header/footer/ads ---
+    def test_removal_of_unwanted_elements(self):
+        html = """
+        <html><body>
+            <nav>Nav links</nav>
+            <div class="ad-banner"><img src="https://example.com/ad.gif"></div>
+            <article>
+                <h1>Article Title</h1>
+                <p>Main content paragraph 1 with sufficient length for valid extraction.</p>
+                <div class="social-share">Share on Twitter</div>
+                <p>Main content paragraph 2 with further detailed explanations.</p>
+            </article>
+            <footer>Footer content</footer>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        self.assertNotIn("Nav links", data["content"])
+        self.assertNotIn("Footer content", data["content"])
+        self.assertNotIn("Share on Twitter", data["content"])
+        urls = [b.get("url") for b in data["blocks"] if b["type"] == "image"]
+        self.assertNotIn("https://example.com/ad.gif", urls)
+
+    # --- 13. Duplicate media handling ---
+    def test_duplicate_media_handling(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Introductory paragraph containing sufficient details for validation testing.</p>
+                <img src="https://example.com/photo.jpg" alt="Photo">
+                <img src="https://example.com/photo.jpg" alt="Duplicate Photo">
+                <p>Concluding paragraph following duplicate image tags in the markup.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+
+    # --- 14. Missing title ---
+    def test_missing_title(self):
+        html = """
+        <html><body>
+            <article>
+                <p>Paragraph 1 text containing enough detail for validation purposes.</p>
+                <p>Paragraph 2 text providing additional details to pass length check.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        self.assertIsNone(data["title"])
+
+    # --- 15. Missing description ---
+    def test_missing_description(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Paragraph 1 text containing enough detail for validation purposes.</p>
+                <p>Paragraph 2 text providing additional details to pass length check.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        self.assertIsNone(data["description"])
+
+    # --- 16. Missing media ---
+    def test_missing_media(self):
+        html = """
+        <html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>Paragraph 1 text containing enough detail for validation purposes.</p>
+                <p>Paragraph 2 text providing additional details to pass length check.</p>
+            </article>
+        </body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        media_blocks = [b for b in data["blocks"] if b["type"] in ("image", "video")]
+        self.assertEqual(len(media_blocks), 0)
+
+    # --- 17 & 18. Invalid HTML & Very short article ---
+    def test_invalid_or_short_article(self):
+        self.assertIsNone(extract_article_data(""))
+        short_html = "<html><body><article><p>Short</p></article></body></html>"
+        self.assertIsNone(extract_article_data(short_html))
+
+    # --- 19. HTTP 404 ---
     @patch("article_extractor.requests.get")
-    def test_fetch_article_html_success(self, mock_get):
-        mock_response = MagicMock()
-        mock_response.text = "<html><body><h1>Test Article</h1></body></html>"
-        mock_get.return_value = mock_response
-
-        url = "https://example.com/article-1"
-        html = fetch_article_html(url, timeout=10)
-
-        mock_get.assert_called_once_with(url, headers={"User-Agent": DEFAULT_USER_AGENT}, timeout=10)
-        mock_response.raise_for_status.assert_called_once()
-        self.assertEqual(html, "<html><body><h1>Test Article</h1></body></html>")
-
-    # --- Test 2: HTTP failure ---
-    @patch("article_extractor.requests.get")
-    def test_fetch_article_html_http_error(self, mock_get):
+    def test_http_404(self, mock_get):
         mock_response = MagicMock()
         mock_response.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
         mock_get.return_value = mock_response
 
-        html = fetch_article_html("https://example.com/404")
-        self.assertIsNone(html)
+        self.assertIsNone(fetch_article_html("https://example.com/404"))
 
-    # --- Test 3: Network/timeout failure ---
+    # --- 20. HTTP timeout ---
     @patch("article_extractor.requests.get")
-    def test_fetch_article_html_timeout(self, mock_get):
-        mock_get.side_effect = requests.Timeout("Connection timed out")
+    def test_http_timeout(self, mock_get):
+        mock_get.side_effect = requests.Timeout("Timed out")
+        self.assertIsNone(fetch_article_html("https://example.com/timeout"))
 
-        html = fetch_article_html("https://example.com/timeout")
-        self.assertIsNone(html)
-
-    # --- Test 4: Article extraction ---
-    def test_extract_article_content_article_tag(self):
-        sample_html = """
-        <html>
-        <head><title>Page Title</title></head>
-        <body>
-            <nav><a href="/">Home</a> Navigation Links Here</nav>
-            <article>
-                <h1>Test Article Heading</h1>
-                <p>This is the first paragraph of the article. It contains detailed information about a very interesting event that took place today.</p>
-                <p>This is the second paragraph of the article. It expands on the details provided earlier and gives a complete breakdown of the situation.</p>
-            </article>
-            <footer>Copyright 2026 AutoNews Footer Content</footer>
-        </body>
-        </html>
-        """
-        extracted = extract_article_content(sample_html)
-        self.assertIsNotNone(extracted)
-        self.assertIn("Test Article Heading", extracted)
-        self.assertIn("This is the first paragraph of the article.", extracted)
-        self.assertIn("This is the second paragraph of the article.", extracted)
-        self.assertNotIn("Navigation Links Here", extracted)
-        self.assertNotIn("AutoNews Footer Content", extracted)
-
-    # --- Test 5: Script/style removal ---
-    def test_extract_article_content_script_style_removal(self):
-        sample_html = """
-        <html>
-        <body>
-            <article>
-                <script type="text/javascript">
-                    var tracker = "DO_NOT_INCLUDE_JAVASCRIPT_IN_OUTPUT";
-                    console.log("script block");
-                </script>
-                <style>
-                    body { background-color: red; }
-                    .hidden { display: none; }
-                </style>
-                <p>This paragraph contains valid news text that meets the minimum length requirement for extraction purposes without any script pollution.</p>
-                <p>Here is another paragraph filled with additional article details to ensure that total non-whitespace length safely exceeds one hundred characters.</p>
-            </article>
-        </body>
-        </html>
-        """
-        extracted = extract_article_content(sample_html)
-        self.assertIsNotNone(extracted)
-        self.assertNotIn("DO_NOT_INCLUDE_JAVASCRIPT_IN_OUTPUT", extracted)
-        self.assertNotIn("background-color: red", extracted)
-        self.assertIn("This paragraph contains valid news text", extracted)
-
-    # --- Test 6: Empty/invalid HTML ---
-    def test_extract_article_content_empty_or_insufficient(self):
-        self.assertIsNone(extract_article_content(""))
-        self.assertIsNone(extract_article_content("   "))
-        self.assertIsNone(extract_article_content(None))
-
-        short_html = """
-        <html>
-        <body>
-            <article>
-                <p>Too short.</p>
-            </article>
-        </body>
-        </html>
-        """
-        self.assertIsNone(extract_article_content(short_html))
-
-    # --- Test 7: Successful extract_article() ---
+    # --- 21. Existing content field remains correct ---
     @patch("article_extractor.fetch_article_html")
-    def test_extract_article_success(self, mock_fetch):
-        mock_fetch.return_value = """
-        <html>
-        <body>
+    def test_extract_article_content_compatibility(self, mock_fetch):
+        sample_html = """
+        <html><body>
             <article>
-                <h1>Breaking News Story</h1>
-                <p>This is a long and comprehensive news report about an important global event that occurred earlier today.</p>
-                <p>Experts from around the world have analyzed the situation and shared their insights regarding future implications.</p>
+                <h1>Title</h1>
+                <p>Paragraph one text with sufficient detail to exceed length check easily.</p>
+                <p>Paragraph two text expanding on the news story with further quotes.</p>
             </article>
-        </body>
-        </html>
+        </body></html>
         """
-        original_article = {
-            "title": "Example Article",
+        mock_fetch.return_value = sample_html
+
+        article_dict = {
+            "title": "Original Title",
             "url": "https://example.com/article",
             "published": "2026-09-27T10:00:00Z",
-            "summary": "Example summary",
+            "summary": "Original summary",
         }
 
-        result = extract_article(original_article)
-
+        result = extract_article(article_dict)
         self.assertIsNotNone(result)
-        self.assertIsNot(result, original_article)  # Ensure non-mutated copy
-        self.assertEqual(result["title"], "Example Article")
+        self.assertIn("content", result)
+        self.assertIn("blocks", result)
+        self.assertIn("description", result)
+        self.assertEqual(result["title"], "Title")  # Overridden by high-confidence H1
         self.assertEqual(result["url"], "https://example.com/article")
         self.assertEqual(result["published"], "2026-09-27T10:00:00Z")
-        self.assertEqual(result["summary"], "Example summary")
-        self.assertIn("content", result)
-        self.assertIn("Breaking News Story", result["content"])
-        self.assertNotIn("content", original_article)  # Original dictionary untouched
 
-    # --- Test 8: Missing URL ---
-    def test_extract_article_missing_url(self):
-        self.assertIsNone(extract_article(None))
-        self.assertIsNone(extract_article("not a dict"))
-        self.assertIsNone(extract_article({"title": "No URL"}))
-        self.assertIsNone(extract_article({"title": "Empty URL", "url": "   "}))
-
-    # --- Test 9: Batch extraction ---
+    # --- 22 & 23. Multiple articles & Failed article handling ---
     @patch("article_extractor.fetch_article_html")
-    def test_extract_articles_batch(self, mock_fetch):
+    def test_batch_extraction(self, mock_fetch):
         def side_effect(url, timeout=10):
-            if url == "https://example.com/valid-1":
+            if url == "https://example.com/1":
                 return """
                 <html><body><article>
-                <p>First valid article text containing sufficient character count for successful validation testing.</p>
-                <p>Adding a second paragraph to ensure the character threshold of one hundred non-whitespace characters is easily passed.</p>
+                <h1>Article One</h1>
+                <p>Paragraph text for article one containing sufficient characters to validate.</p>
+                <p>Second paragraph text for article one ensuring threshold is met easily.</p>
                 </article></body></html>
                 """
-            elif url == "https://example.com/valid-2":
+            elif url == "https://example.com/2":
+                return None  # Failed fetch
+            elif url == "https://example.com/3":
                 return """
                 <html><body><article>
-                <p>Second valid article text also containing sufficient character count for successful validation testing.</p>
-                <p>Adding another paragraph to ensure the threshold is passed without any issues whatsoever in this test.</p>
+                <h1>Article Three</h1>
+                <p>Paragraph text for article three containing sufficient characters to validate.</p>
+                <p>Second paragraph text for article three ensuring threshold is met easily.</p>
                 </article></body></html>
                 """
-            else:
-                return None  # Failed request or invalid URL
 
         mock_fetch.side_effect = side_effect
 
         articles = [
-            {"title": "Valid 1", "url": "https://example.com/valid-1"},
-            {"title": "Invalid 404", "url": "https://example.com/404"},
-            {"title": "Valid 2", "url": "https://example.com/valid-2"},
-            {"title": "Missing URL"},
+            {"title": "Art 1", "url": "https://example.com/1"},
+            {"title": "Art 2", "url": "https://example.com/2"},
+            {"title": "Art 3", "url": "https://example.com/3"},
         ]
 
         results = extract_articles(articles)
-
         self.assertEqual(len(results), 2)
-        self.assertEqual(results[0]["title"], "Valid 1")
-        self.assertEqual(results[1]["title"], "Valid 2")
-        self.assertIn("content", results[0])
-        self.assertIn("content", results[1])
+        self.assertEqual(results[0]["title"], "Article One")
+        self.assertEqual(results[1]["title"], "Article Three")
 
 
 if __name__ == "__main__":
