@@ -12,7 +12,7 @@ MIN_CONTENT_LENGTH = 100
 
 # Patterns for elements/classes/ids to decompose (e.g., ads, comments, social shares, widgets)
 UNWANTED_CLASSES_IDS = re.compile(
-    r"(?:^|[\-_])(?:ad|ads|advertisement|banner|sidebar|comments|related|social|share|nav|menu|footer|header|cookie|consent|newsletter|recommendation|widget)(?:[\-_]|$)",
+    r"(?:^|[\-_])(?:ad|ads|advertisement|banner|sidebar|comments|related|social|share|nav|menu|footer|header|cookie|consent|newsletter|recommendation|widget|recirculation|outbrain|taboola|sponsored|polopoly)(?:[\-_]|$)",
     re.IGNORECASE,
 )
 
@@ -86,12 +86,20 @@ def _extract_title(soup: BeautifulSoup, container: Optional[Tag]) -> Tuple[Optio
     Returns:
         tuple: (title_str | None, is_high_confidence_h1: bool)
     """
-    # 1. High-confidence H1 inside article container or soup
-    h1 = container.find("h1") if container else soup.find("h1")
-    if h1 and isinstance(h1, Tag):
-        h1_text = _clean_text(h1.get_text())
-        if h1_text and len(h1_text) >= 3:
-            return h1_text, True
+    # 1. High-confidence H1 inside article container
+    if container:
+        h1 = container.find("h1")
+        if h1 and isinstance(h1, Tag):
+            h1_text = _clean_text(h1.get_text())
+            if h1_text and len(h1_text) >= 3:
+                return h1_text, True
+
+    # 1b. High-confidence H1 globally in soup
+    global_h1 = soup.find("h1")
+    if global_h1 and isinstance(global_h1, Tag):
+        global_h1_text = _clean_text(global_h1.get_text())
+        if global_h1_text and len(global_h1_text) >= 3:
+            return global_h1_text, True
 
     # 2. Open Graph or Twitter title meta tags
     og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
@@ -160,12 +168,13 @@ def _resolve_image_url(img_tag: Tag) -> Optional[str]:
         if val and isinstance(val, str) and not val.startswith("data:image/"):
             return val.strip()
 
-    srcset = img_tag.get("srcset")
-    if srcset and isinstance(srcset, str):
-        candidates = [c.strip().split()[0] for c in srcset.split(",") if c.strip()]
-        valid_candidates = [c for c in candidates if not c.startswith("data:image/")]
-        if valid_candidates:
-            return valid_candidates[-1]
+    for srcset_attr in ("srcset", "data-srcset"):
+        srcset = img_tag.get(srcset_attr)
+        if srcset and isinstance(srcset, str):
+            candidates = [c.strip().split()[0] for c in srcset.split(",") if c.strip()]
+            valid_candidates = [c for c in candidates if not c.startswith("data:image/")]
+            if valid_candidates:
+                return valid_candidates[-1]
 
     return None
 
@@ -269,9 +278,9 @@ def _clean_soup_for_extraction(soup: BeautifulSoup) -> None:
     for tag in soup.find_all(["script", "style", "noscript", "nav", "footer", "aside", "form", "svg"]):
         tag.decompose()
 
-    # Decompose header tags only if not inside an article
+    # Decompose header tags only if not inside an article or article body
     for header_tag in soup.find_all("header"):
-        if not header_tag.find_parent("article"):
+        if not header_tag.find_parent("article") and not header_tag.find_parent(id="article-body"):
             header_tag.decompose()
 
     # Decompose unwanted containers by class/id
@@ -283,16 +292,48 @@ def _clean_soup_for_extraction(soup: BeautifulSoup) -> None:
         tag_id = tag.get("id") or ""
 
         if UNWANTED_CLASSES_IDS.search(class_str) or UNWANTED_CLASSES_IDS.search(tag_id):
-            if tag.name not in ("body", "main", "article", "header"):
+            if tag.name not in ("body", "main", "article", "header") and tag_id != "article-body":
                 tag.decompose()
 
 
 def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
-    """Find the best article container using prioritized heuristics."""
+    """Find the best article container using prioritized heuristics.
+
+    Priority:
+    1. #article-body element
+    2. .text-copy.bodyCopy container
+    3. <article> tag
+    4. <main> tag
+    5. ARTICLE_CONTAINER_PATTERNS
+    6. <body> tag
+    """
+    # 1. #article-body
+    article_body = soup.find(id="article-body")
+    if article_body and isinstance(article_body, Tag):
+        return article_body
+
+    # 2. .text-copy.bodyCopy
+    body_copy = soup.find(
+        lambda tag: isinstance(tag, Tag)
+        and tag.attrs is not None
+        and tag.get("class")
+        and "text-copy" in tag.get("class")
+        and any("bodyCopy" in c for c in tag.get("class"))
+    )
+    if body_copy and isinstance(body_copy, Tag):
+        return body_copy
+
+    # 3. <article>
     article_tag = soup.find("article")
     if article_tag and isinstance(article_tag, Tag):
         return article_tag
 
+    # 4. <main>
+    main_tag = soup.find("main")
+    if main_tag and isinstance(main_tag, Tag):
+        return main_tag
+
+    # 5. ARTICLE_CONTAINER_PATTERNS
     for tag in soup.find_all(True):
         if not isinstance(tag, Tag) or tag.attrs is None:
             continue
@@ -303,10 +344,7 @@ def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
         if ARTICLE_CONTAINER_PATTERNS.search(class_str) or ARTICLE_CONTAINER_PATTERNS.search(tag_id):
             return tag
 
-    main_tag = soup.find("main")
-    if main_tag and isinstance(main_tag, Tag):
-        return main_tag
-
+    # 6. <body>
     body_tag = soup.body
     if body_tag and isinstance(body_tag, Tag):
         return body_tag
@@ -379,7 +417,7 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
                 blocks.append(video_block)
             processed_elements.add(element)
 
-        # 5. Paragraphs, Blockquotes, List items
+        # 5. Paragraphs, Blockquotes, List items (represented as paragraph blocks)
         elif tag_name in ("p", "blockquote", "li"):
             nested_imgs = element.find_all("img")
             nested_videos = element.find_all(["video", "iframe"])

@@ -14,6 +14,61 @@ from article_extractor import (
 
 class TestArticleExtractor(unittest.TestCase):
 
+    # --- PC Gamer Regression Structure Test ---
+    def test_pcgamer_article_structure(self):
+        pcgamer_html = """
+        <html>
+        <head>
+            <meta property="og:description" content="A major update is coming to the classic 34-year-old survival game this autumn.">
+        </head>
+        <body>
+            <header><a href="/">PC Gamer Logo Nav</a></header>
+            <h1>A 'fundamental' update for this 34-year-old survival game is coming in October</h1>
+            <div id="article-body">
+                <div class="text-copy bodyCopy auto">
+                    <p>Unreal Unearth and preceding survival games have been classic staples of PC gaming for decades, evolving through multiple engine generations.</p>
+                    <h2>Major Overhaul Details</h2>
+                    <p>Developers revealed today that October will bring groundbreaking changes to mechanics, graphics, and underlying world generation code.</p>
+                    <ul>
+                        <li>New crafting system built from scratch</li>
+                        <li>Updated multiplayer server architecture</li>
+                    </ul>
+                    <figure>
+                        <img data-srcset="https://cdn.mos.cms.futurecdn.net/game_screenshot_small.jpg 480w, https://cdn.mos.cms.futurecdn.net/game_screenshot_large.jpg 1200w" alt="Survival Game Screenshot">
+                        <figcaption>A first look at the newly updated graphics engine in action.</figcaption>
+                    </figure>
+                    <p>Expect further announcements and public beta testing opportunities to roll out in late September prior to official release.</p>
+                    <div class="recirculation-widget">
+                        <p>Unrelated Article: Top 10 Graphics Cards 2026</p>
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        data = extract_article_data(pcgamer_html)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["title"], "A 'fundamental' update for this 34-year-old survival game is coming in October")
+        self.assertEqual(data["description"], "A major update is coming to the classic 34-year-old survival game this autumn.")
+        self.assertTrue(len(data["content"].replace(" ", "")) >= 100)
+
+        # Check block ordering
+        block_types = [b["type"] for b in data["blocks"]]
+        self.assertEqual(
+            block_types,
+            ["paragraph", "heading", "paragraph", "paragraph", "paragraph", "image", "paragraph"],
+        )
+
+        # Check image block details
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://cdn.mos.cms.futurecdn.net/game_screenshot_large.jpg")
+        self.assertEqual(img_blocks[0]["alt"], "Survival Game Screenshot")
+        self.assertEqual(img_blocks[0]["caption"], "A first look at the newly updated graphics engine in action.")
+
+        # Check exclusion of recirculation ad content
+        self.assertNotIn("Top 10 Graphics Cards", data["content"])
+
     # --- 1. Article title extraction ---
     def test_extract_title(self):
         html = """
@@ -300,7 +355,7 @@ class TestArticleExtractor(unittest.TestCase):
         self.assertIn("content", result)
         self.assertIn("blocks", result)
         self.assertIn("description", result)
-        self.assertEqual(result["title"], "Title")  # Overridden by high-confidence H1
+        self.assertEqual(result["title"], "Title")
         self.assertEqual(result["url"], "https://example.com/article")
         self.assertEqual(result["published"], "2026-09-27T10:00:00Z")
 
@@ -317,7 +372,7 @@ class TestArticleExtractor(unittest.TestCase):
                 </article></body></html>
                 """
             elif url == "https://example.com/2":
-                return None  # Failed fetch
+                return None
             elif url == "https://example.com/3":
                 return """
                 <html><body><article>
