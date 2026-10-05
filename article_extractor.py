@@ -268,34 +268,6 @@ def _extract_video_block(tag: Tag) -> Optional[Dict[str, Any]]:
     }
 
 
-def _clean_soup_for_extraction(soup: BeautifulSoup) -> None:
-    """Decompose non-content tags, comments, and obvious ad/nav containers in place."""
-    # Remove HTML comments
-    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
-        comment.extract()
-
-    # Decompose unwanted tags
-    for tag in soup.find_all(["script", "style", "noscript", "nav", "footer", "aside", "form", "svg"]):
-        tag.decompose()
-
-    # Decompose header tags only if not inside an article or article body
-    for header_tag in soup.find_all("header"):
-        if not header_tag.find_parent("article") and not header_tag.find_parent(id="article-body"):
-            header_tag.decompose()
-
-    # Decompose unwanted containers by class/id
-    for tag in soup.find_all(True):
-        if not isinstance(tag, Tag) or tag.attrs is None:
-            continue
-        classes = tag.get("class")
-        class_str = " ".join(classes) if isinstance(classes, list) else (classes or "")
-        tag_id = tag.get("id") or ""
-
-        if UNWANTED_CLASSES_IDS.search(class_str) or UNWANTED_CLASSES_IDS.search(tag_id):
-            if tag.name not in ("body", "main", "article", "header") and tag_id != "article-body":
-                tag.decompose()
-
-
 def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
     """Find the best article container using prioritized heuristics.
 
@@ -350,6 +322,34 @@ def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
         return body_tag
 
     return None
+
+
+def _clean_container(container: Tag) -> None:
+    """Decompose non-content elements inside container while preserving article text structures."""
+    # Remove HTML comments
+    for comment in container.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+
+    # Decompose unwanted tag types
+    for tag in container.find_all(["script", "style", "noscript", "nav", "footer", "aside", "form", "svg"]):
+        tag.decompose()
+
+    # Decompose header tags only if not containing article title/heading
+    for header_tag in container.find_all("header"):
+        if not header_tag.find(["h1", "h2"]):
+            header_tag.decompose()
+
+    # Decompose unwanted containers by class/id
+    for tag in list(container.find_all(True)):
+        if not isinstance(tag, Tag) or tag.attrs is None:
+            continue
+        classes = tag.get("class")
+        class_str = " ".join(classes) if isinstance(classes, list) else (classes or "")
+        tag_id = tag.get("id") or ""
+
+        if UNWANTED_CLASSES_IDS.search(class_str) or UNWANTED_CLASSES_IDS.search(tag_id):
+            if tag is not container and tag.name not in ("body", "main", "article") and tag_id != "article-body":
+                tag.decompose()
 
 
 def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
@@ -476,8 +476,6 @@ def extract_article_data(html_content: str, fallback_summary: Optional[str] = No
         logger.error("Failed to parse HTML with BeautifulSoup: %s", exc)
         return None
 
-    _clean_soup_for_extraction(soup)
-
     container = _find_article_container(soup)
     if not container:
         logger.warning("No suitable article container found in HTML.")
@@ -485,6 +483,8 @@ def extract_article_data(html_content: str, fallback_summary: Optional[str] = No
 
     title, is_high_confidence_h1 = _extract_title(soup, container)
     description = _extract_description(soup, container, fallback_summary=fallback_summary)
+
+    _clean_container(container)
 
     blocks = _extract_blocks(container)
 

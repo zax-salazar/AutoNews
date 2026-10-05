@@ -14,6 +14,54 @@ from article_extractor import (
 
 class TestArticleExtractor(unittest.TestCase):
 
+    # --- PC Gamer Real Fixture Regression Test ---
+    def test_pcgamer_real_fixture_structure(self):
+        pcgamer_html = """
+        <html>
+        <head>
+            <meta property="og:description" content="Are you ready to make some socks?">
+        </head>
+        <body>
+            <header><a href="/">PC Gamer Header Navigation</a></header>
+            <h1>A 'fundamental' update for this 34-year-old survival game is coming in October</h1>
+            <div id="article-body">
+                <div class="text-copy bodyCopy auto">
+                    <h2>Test Heading</h2>
+                    <p>First paragraph detailing the new mechanics coming to the classic 34-year-old survival game update this autumn.</p>
+                    <figure>
+                        <img src="https://example.com/image.jpg" alt="Test image">
+                        <figcaption>Test caption</figcaption>
+                    </figure>
+                    <p>Second paragraph explaining the crafting overhaul and player feedback regarding socks and clothing.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        data = extract_article_data(pcgamer_html)
+        self.assertIsNotNone(data)
+        self.assertEqual(
+            data["title"],
+            "A 'fundamental' update for this 34-year-old survival game is coming in October",
+        )
+        self.assertEqual(data["description"], "Are you ready to make some socks?")
+        self.assertTrue(len(data["content"].replace(" ", "")) >= 100)
+
+        # Check block ordering: heading, paragraph, image, paragraph
+        block_types = [b["type"] for b in data["blocks"]]
+        self.assertEqual(block_types, ["heading", "paragraph", "image", "paragraph"])
+
+        # Verify image attributes
+        img_block = [b for b in data["blocks"] if b["type"] == "image"][0]
+        self.assertEqual(img_block["url"], "https://example.com/image.jpg")
+        self.assertEqual(img_block["alt"], "Test image")
+        self.assertEqual(img_block["caption"], "Test caption")
+
+        # Verify content text
+        self.assertIn("Test Heading", data["content"])
+        self.assertIn("First paragraph detailing", data["content"])
+        self.assertIn("Second paragraph explaining", data["content"])
+
     # --- PC Gamer Regression Structure Test ---
     def test_pcgamer_article_structure(self):
         pcgamer_html = """
