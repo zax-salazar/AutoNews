@@ -12,7 +12,7 @@ MIN_CONTENT_LENGTH = 100
 
 # Patterns for elements/classes/ids to decompose (e.g., ads, comments, social shares, widgets)
 UNWANTED_CLASSES_IDS = re.compile(
-    r"(?:^|[\-_])(?:ad|ads|advertisement|banner|sidebar|comments|related|social|share|nav|menu|footer|header|cookie|consent|newsletter|recommendation|widget|recirculation|outbrain|taboola|sponsored|polopoly)(?:[\-_]|$)",
+    r"(?:^|[\-_])(?:ad|ads|advertisement|banner|sidebar|comments|related|social|share|nav|menu|footer|cookie|consent|newsletter|recommendation|widget|recirculation|outbrain|taboola|sponsored|polopoly)(?:[\-_]|$)",
     re.IGNORECASE,
 )
 
@@ -30,7 +30,7 @@ DEK_PATTERNS = re.compile(
 
 # Patterns for filtering unwanted images (tracking pixels, avatars, icons, logos, ads)
 UNWANTED_IMAGE_PATTERNS = re.compile(
-    r"(?:pixel|spacer|blank|tracking|avatar|logo|icon|social|button|ad|banner|analytics|1x1)",
+    r"(?:pixel|spacer|blank|tracking|avatar|logo|icon|social|button|banner|analytics|1x1|(?:^|[\-_/\.])ads?(?:[\-_/\.]|$))",
     re.IGNORECASE,
 )
 
@@ -159,15 +159,17 @@ def _extract_description(
 
 
 def _resolve_image_url(img_tag: Tag) -> Optional[str]:
-    """Extract best image URL from <img> attributes (supporting lazy loading and srcset)."""
+    """Extract best image URL from <img> attributes or parent/sibling <source> tags."""
     if img_tag.attrs is None:
         return None
 
+    # 1. Check direct img attributes (data-src, data-lazy-src, data-original, src)
     for attr in ("data-src", "data-lazy-src", "data-original", "src"):
         val = img_tag.get(attr)
         if val and isinstance(val, str) and not val.startswith("data:image/"):
             return val.strip()
 
+    # 2. Check direct img srcset attributes (srcset, data-srcset)
     for srcset_attr in ("srcset", "data-srcset"):
         srcset = img_tag.get(srcset_attr)
         if srcset and isinstance(srcset, str):
@@ -175,6 +177,20 @@ def _resolve_image_url(img_tag: Tag) -> Optional[str]:
             valid_candidates = [c for c in candidates if not c.startswith("data:image/")]
             if valid_candidates:
                 return valid_candidates[-1]
+
+    # 3. Check parent <picture> or sibling <source> tags
+    parent = img_tag.parent
+    if parent and isinstance(parent, Tag):
+        sources = parent.find_all("source") if parent.name == "picture" else []
+        for source in sources:
+            if isinstance(source, Tag) and source.attrs:
+                for attr in ("srcset", "data-srcset", "src", "data-src"):
+                    val = source.get(attr)
+                    if val and isinstance(val, str):
+                        candidates = [c.strip().split()[0] for c in val.split(",") if c.strip()]
+                        valid_candidates = [c for c in candidates if not c.startswith("data:image/")]
+                        if valid_candidates:
+                            return valid_candidates[-1]
 
     return None
 
@@ -389,6 +405,7 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
                 if img_block and img_block["url"] not in seen_media_urls:
                     seen_media_urls.add(img_block["url"])
                     blocks.append(img_block)
+                processed_elements.add(img)
             else:
                 video = element.find(["video", "iframe"])
                 if video and isinstance(video, Tag) and video.attrs is not None:
@@ -396,6 +413,7 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
                     if video_block and video_block["url"] not in seen_media_urls:
                         seen_media_urls.add(video_block["url"])
                         blocks.append(video_block)
+                    processed_elements.add(video)
 
             processed_elements.add(element)
             for child in element.find_all(True):
@@ -403,11 +421,16 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
 
         # 3. Standalone Image
         elif tag_name == "img":
-            img_block = _extract_image_block(element)
+            parent_figure = element.find_parent("figure")
+            img_block = _extract_image_block(element, parent_figure=parent_figure)
             if img_block and img_block["url"] not in seen_media_urls:
                 seen_media_urls.add(img_block["url"])
                 blocks.append(img_block)
             processed_elements.add(element)
+            if parent_figure:
+                processed_elements.add(parent_figure)
+                for child in parent_figure.find_all(True):
+                    processed_elements.add(child)
 
         # 4. Standalone Video or Iframe
         elif tag_name in ("video", "iframe"):
@@ -431,7 +454,8 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
 
             for img in nested_imgs:
                 if isinstance(img, Tag) and img.attrs is not None and img not in processed_elements:
-                    img_block = _extract_image_block(img)
+                    parent_fig = img.find_parent("figure")
+                    img_block = _extract_image_block(img, parent_figure=parent_fig)
                     if img_block and img_block["url"] not in seen_media_urls:
                         seen_media_urls.add(img_block["url"])
                         blocks.append(img_block)
