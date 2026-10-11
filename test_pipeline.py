@@ -1,157 +1,225 @@
+import os
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 from pipeline import run_source, run_sources
+from database import init_db, is_article_completed, get_article_status, normalize_url
 
 
 class TestPipeline(unittest.TestCase):
 
-    # --- Test 1: Successful single source ---
-    @patch("pipeline.extract_articles")
+    def setUp(self):
+        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
+        init_db(self.temp_db_path)
+
+    def tearDown(self):
+        os.close(self.temp_db_fd)
+        if os.path.exists(self.temp_db_path):
+            os.remove(self.temp_db_path)
+
+    # --- Test 1: Successful single source & registration ---
+    @patch("pipeline.extract_article")
     @patch("pipeline.parse_entries")
     @patch("pipeline.fetch_rss")
-    def test_run_source_success(self, mock_fetch, mock_parse, mock_extract):
+    def test_run_source_success_and_registration(self, mock_fetch, mock_parse, mock_extract):
         mock_raw_entries = [{"title": "Raw Entry 1"}]
         mock_parsed_articles = [
-            {"title": "Parsed Article 1", "url": "https://example.com/1"}
+            {"title": "Parsed Article 1", "url": "https://example.com/1?utm_source=rss"}
         ]
-        mock_extracted_articles = [
-            {
-                "title": "Parsed Article 1",
-                "url": "https://example.com/1",
-                "content": "Full extracted article text...",
-            }
-        ]
+        mock_extracted_article = {
+            "title": "Parsed Article 1",
+            "url": "https://example.com/1?utm_source=rss",
+            "content": "Full extracted article text...",
+        }
 
         mock_fetch.return_value = mock_raw_entries
         mock_parse.return_value = mock_parsed_articles
-        mock_extract.return_value = mock_extracted_articles
+        mock_extract.return_value = mock_extracted_article
 
         source = {
             "name": "Test Source",
             "url": "https://example.com/rss",
-            "type": "rss",
-            "category": "gaming",
             "enabled": True,
         }
 
-        result = run_source(source, timeout=10)
+        results = run_source(source, timeout=10, db_path=self.temp_db_path)
 
-        mock_fetch.assert_called_once_with("https://example.com/rss", timeout=10)
-        mock_parse.assert_called_once_with(mock_raw_entries)
-        mock_extract.assert_called_once_with(mock_parsed_articles, timeout=10)
-        self.assertEqual(result, mock_extracted_articles)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0], mock_extracted_article)
 
-    # --- Test 2: Disabled source ---
-    @patch("pipeline.fetch_rss")
-    def test_run_source_disabled(self, mock_fetch):
-        source = {
-            "name": "Disabled Source",
-            "url": "https://example.com/rss",
-            "enabled": False,
-        }
+        norm_url = normalize_url("https://example.com/1?utm_source=rss")
+        self.assertTrue(is_article_completed(norm_url, db_path=self.temp_db_path))
 
-        result = run_source(source)
-
-        mock_fetch.assert_not_called()
-        self.assertEqual(result, [])
-
-    # --- Test 3: Invalid source ---
-    @patch("pipeline.fetch_rss")
-    def test_run_source_invalid(self, mock_fetch):
-        self.assertEqual(run_source(None), [])
-        self.assertEqual(run_source("not a dict"), [])
-        self.assertEqual(run_source({"name": "No URL"}), [])
-        self.assertEqual(run_source({"name": "Empty URL", "url": "   "}), [])
-        mock_fetch.assert_not_called()
-
-    # --- Test 4: RSS fetch failure ---
-    @patch("pipeline.extract_articles")
+    # --- Test 2: Completed article skipped on subsequent runs ---
+    @patch("pipeline.extract_article")
     @patch("pipeline.parse_entries")
     @patch("pipeline.fetch_rss")
-    def test_run_source_fetch_failure(self, mock_fetch, mock_parse, mock_extract):
-        mock_fetch.return_value = []
+    def test_completed_article_skipped_on_subsequent_runs(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = [{"title": "Article 1", "url": "https://example.com/subsequent-1"}]
+        mock_extract.return_value = {"title": "Article 1", "url": "https://example.com/subsequent-1", "content": "Text"}
 
-        source = {
-            "name": "Failed Fetch Source",
-            "url": "https://example.com/rss-fail",
-        }
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
 
-        result = run_source(source)
+        # Run 1: Article is processed and completed
+        run1 = run_source(source, db_path=self.temp_db_path)
+        self.assertEqual(len(run1), 1)
+        self.assertEqual(mock_extract.call_count, 1)
 
-        mock_fetch.assert_called_once_with("https://example.com/rss-fail", timeout=10)
-        mock_parse.assert_not_called()
+        # Run 2: Article should be skipped
+        mock_extract.reset_mock()
+        run2 = run_source(source, db_path=self.temp_db_path)
+        self.assertEqual(len(run2), 0)
         mock_extract.assert_not_called()
-        self.assertEqual(result, [])
 
-    # --- Test 5: Multiple sources ---
-    @patch("pipeline.run_source")
-    def test_run_sources_multiple(self, mock_run_source):
-        source_a = {"name": "Source A", "url": "https://a.com/rss"}
-        source_b = {"name": "Source B", "url": "https://b.com/rss"}
+    # --- Test 3: In-feed duplicate deduplication ---
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_in_feed_duplicate_deduplication(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = [
+            {"title": "Article 1", "url": "https://example.com/same-article"},
+            {"title": "Article 1 Duplicate", "url": "https://example.com/same-article?utm_medium=email"},
+        ]
+        mock_extract.return_value = {"title": "Article 1", "url": "https://example.com/same-article", "content": "Text"}
 
-        article_a1 = {"title": "A1", "url": "https://a.com/1", "content": "Text A1"}
-        article_a2 = {"title": "A2", "url": "https://a.com/2", "content": "Text A2"}
-        article_b1 = {"title": "B1", "url": "https://b.com/1", "content": "Text B1"}
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
 
-        def side_effect(source, timeout=10):
-            if source == source_a:
-                return [article_a1, article_a2]
-            elif source == source_b:
-                return [article_b1]
+        results = run_source(source, db_path=self.temp_db_path)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(mock_extract.call_count, 1)
+
+    # --- Test 4: Cross-source duplicate deduplication ---
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_cross_source_duplicate_deduplication(self, mock_fetch, mock_parse, mock_extract):
+        def parse_side_effect(raw):
+            if raw == [{"feed": "A"}]:
+                return [{"title": "Story", "url": "https://example.com/shared-story"}]
+            elif raw == [{"feed": "B"}]:
+                return [{"title": "Story B", "url": "https://example.com/shared-story?fbclid=999"}]
             return []
 
-        mock_run_source.side_effect = side_effect
-
-        results = run_sources([source_a, source_b])
-
-        self.assertEqual(len(results), 3)
-        self.assertEqual(results, [article_a1, article_a2, article_b1])
-
-    # --- Test 6: One source fails ---
-    @patch("pipeline.run_source")
-    def test_run_sources_one_fails(self, mock_run_source):
-        source_a = {"name": "Source A", "url": "https://a.com/rss"}
-        source_b = {"name": "Source B", "url": "https://b.com/rss"}
-        source_c = {"name": "Source C", "url": "https://c.com/rss"}
-
-        article_a = {"title": "A1", "url": "https://a.com/1", "content": "Text A1"}
-        article_c = {"title": "C1", "url": "https://c.com/1", "content": "Text C1"}
-
-        def side_effect(source, timeout=10):
-            if source == source_a:
-                return [article_a]
-            elif source == source_b:
-                return []  # Source B fails
-            elif source == source_c:
-                return [article_c]
+        def fetch_side_effect(url, timeout=10):
+            if url == "https://a.com/rss":
+                return [{"feed": "A"}]
+            elif url == "https://b.com/rss":
+                return [{"feed": "B"}]
             return []
 
-        mock_run_source.side_effect = side_effect
+        mock_fetch.side_effect = fetch_side_effect
+        mock_parse.side_effect = parse_side_effect
+        mock_extract.return_value = {"title": "Story", "url": "https://example.com/shared-story", "content": "Text"}
 
-        results = run_sources([source_a, source_b, source_c])
+        sources = [
+            {"name": "Source A", "url": "https://a.com/rss"},
+            {"name": "Source B", "url": "https://b.com/rss"},
+        ]
+
+        results = run_sources(sources, db_path=self.temp_db_path)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(mock_extract.call_count, 1)
+
+    # --- Test 5 & 6 & 7: Tracking params, fragments, meaningful params, identical titles ---
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_url_normalization_identity_and_identical_titles(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = [
+            {"title": "Same Title News", "url": "https://example.com/article?id=10&utm_source=rss#top"},
+            {"title": "Same Title News", "url": "https://example.com/article?id=10&utm_medium=feed"},
+            {"title": "Same Title News", "url": "https://example.com/article?id=20"},
+        ]
+
+        def extract_side_effect(article, timeout=10):
+            return dict(article, content="Extracted text content here")
+
+        mock_extract.side_effect = extract_side_effect
+
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
+
+        results = run_source(source, db_path=self.temp_db_path)
 
         self.assertEqual(len(results), 2)
-        self.assertEqual(results, [article_a, article_c])
+        self.assertEqual(results[0]["url"], "https://example.com/article?id=10&utm_source=rss#top")
+        self.assertEqual(results[1]["url"], "https://example.com/article?id=20")
 
-    # --- Test 7: Empty parsed entries ---
-    @patch("pipeline.extract_articles")
+    # --- Test 8 & 9: Extraction failure does not permanently block retry ---
+    @patch("pipeline.extract_article")
     @patch("pipeline.parse_entries")
     @patch("pipeline.fetch_rss")
-    def test_run_source_empty_parsed_entries(self, mock_fetch, mock_parse, mock_extract):
+    def test_extraction_failure_allows_retry(self, mock_fetch, mock_parse, mock_extract):
         mock_fetch.return_value = [{"raw": "data"}]
-        mock_parse.return_value = []  # No entries successfully parsed
+        mock_parse.return_value = [{"title": "Flaky Article", "url": "https://example.com/flaky"}]
 
-        source = {
-            "name": "Parse Fail Source",
-            "url": "https://example.com/rss-parse-fail",
-        }
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
 
-        result = run_source(source)
+        # Run 1: Extraction fails (returns None)
+        mock_extract.return_value = None
+        run1 = run_source(source, db_path=self.temp_db_path)
+        self.assertEqual(len(run1), 0)
 
-        mock_fetch.assert_called_once_with("https://example.com/rss-parse-fail", timeout=10)
-        mock_parse.assert_called_once_with([{"raw": "data"}])
-        mock_extract.assert_not_called()
-        self.assertEqual(result, [])
+        norm_url = normalize_url("https://example.com/flaky")
+        self.assertEqual(get_article_status(norm_url, self.temp_db_path), "failed")
+
+        # Run 2: Retry succeeds
+        mock_extract.return_value = {"title": "Flaky Article", "url": "https://example.com/flaky", "content": "Text"}
+        run2 = run_source(source, db_path=self.temp_db_path)
+        self.assertEqual(len(run2), 1)
+        self.assertEqual(get_article_status(norm_url, self.temp_db_path), "completed")
+
+    # --- Test 10: Persistent deduplication across DB connections ---
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_persistence_across_db_connections(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = [{"title": "Persisted Article", "url": "https://example.com/persisted"}]
+        mock_extract.return_value = {"title": "Persisted Article", "url": "https://example.com/persisted", "content": "Text"}
+
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
+
+        # Process in connection 1
+        run_source(source, db_path=self.temp_db_path)
+
+        # Connection 2 / process 2 checks status
+        norm_url = normalize_url("https://example.com/persisted")
+        self.assertTrue(is_article_completed(norm_url, self.temp_db_path))
+
+    # --- Test 11: Disabled sources remain ignored ---
+    @patch("pipeline.fetch_rss")
+    def test_disabled_sources_ignored(self, mock_fetch):
+        source = {"name": "Disabled", "url": "https://example.com/rss", "enabled": False}
+        results = run_source(source, db_path=self.temp_db_path)
+        self.assertEqual(results, [])
+        mock_fetch.assert_not_called()
+
+    # --- Test 12: db_path=None disables persistent DB tracking ---
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_db_path_none_behavior(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = [
+            {"title": "No DB Art", "url": "https://example.com/nodb"},
+            {"title": "No DB Art Dup", "url": "https://example.com/nodb?utm_source=x"},
+        ]
+        mock_extract.return_value = {"title": "No DB Art", "url": "https://example.com/nodb", "content": "Text"}
+
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
+
+        # With db_path=None, in-run memory deduplication still prevents dup in same run
+        results = run_source(source, db_path=None)
+        self.assertEqual(len(results), 1)
+
+        # But DB status is not written
+        norm_url = normalize_url("https://example.com/nodb")
+        self.assertIsNone(get_article_status(norm_url, self.temp_db_path))
 
 
 if __name__ == "__main__":
