@@ -123,6 +123,50 @@ class TestDatabase(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "completed")
 
+    def test_orphan_processing_is_not_considered_completed(self):
+        """A crashed run leaves status='processing'; next run must be able to retry."""
+        init_db(self.temp_db_path)
+        norm_url = "https://example.com/orphan-processing"
+
+        record_article(
+            url=norm_url,
+            normalized_url=norm_url,
+            status="processing",
+            db_path=self.temp_db_path,
+        )
+
+        self.assertEqual(
+            get_article_status(norm_url, self.temp_db_path),
+            "processing",
+        )
+        self.assertFalse(
+            is_article_completed(norm_url, self.temp_db_path),
+            "processing must not be treated as completed; "
+            "otherwise crashed runs never retry.",
+        )
+
+    def test_none_db_path_is_a_noop(self):
+        """db_path=None must not persist anything and must not open any DB."""
+        init_db(self.temp_db_path)
+
+        url = "https://example.com/none-db"
+        norm = normalize_url(url)
+
+        # These must silently no-op (early return on falsy db_path).
+        init_db(None)
+        record_article(
+            url=url,
+            normalized_url=norm,
+            status="completed",
+            db_path=None,
+        )
+        mark_article_status(norm, status="completed", db_path=None)
+
+        # Even though we passed status="completed" above with db_path=None,
+        # the temp DB must remain untouched.
+        self.assertIsNone(get_article_status(norm, self.temp_db_path))
+        self.assertFalse(is_article_completed(norm, self.temp_db_path))
+
 
 if __name__ == "__main__":
     unittest.main()
