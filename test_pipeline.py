@@ -173,6 +173,58 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(len(run2), 1)
         self.assertEqual(get_article_status(norm_url, self.temp_db_path), "completed")
 
+    def test_orphan_processing_article_is_retried(self):
+        """A prior crashed run leaves status='processing'; next run must retry."""
+        # Simulate the crashed previous run: record the article as 'processing'
+        # and never transition it to 'completed' or 'failed'.
+        norm_url = normalize_url("https://example.com/crashed-article")
+
+        from database import record_article
+        record_article(
+            url="https://example.com/crashed-article",
+            normalized_url=norm_url,
+            status="processing",
+            db_path=self.temp_db_path,
+        )
+
+        # Sanity: the record really is in 'processing', not 'completed'
+        self.assertEqual(
+            get_article_status(norm_url, self.temp_db_path),
+            "processing",
+        )
+        self.assertFalse(
+            is_article_completed(norm_url, self.temp_db_path),
+            "processing must not count as completed",
+        )
+
+        with patch("pipeline.fetch_rss") as mock_fetch, \
+             patch("pipeline.parse_entries") as mock_parse, \
+             patch("pipeline.extract_article") as mock_extract:
+
+            mock_fetch.return_value = [{"raw": "data"}]
+            mock_parse.return_value = [
+                {"title": "Crashed Article",
+                 "url": "https://example.com/crashed-article"}
+            ]
+            mock_extract.return_value = {
+                "title": "Crashed Article",
+                "url": "https://example.com/crashed-article",
+                "content": "Recovered text",
+            }
+
+            source = {"name": "Test Source", "url": "https://example.com/rss"}
+            results = run_source(source, db_path=self.temp_db_path)
+
+        # The retry must have actually run
+        self.assertEqual(len(results), 1)
+        self.assertEqual(mock_extract.call_count, 1)
+
+        # And the final status must now be 'completed'
+        self.assertEqual(
+            get_article_status(norm_url, self.temp_db_path),
+            "completed",
+        )
+
     # --- Test 10: Persistent deduplication across DB connections ---
     @patch("pipeline.extract_article")
     @patch("pipeline.parse_entries")
@@ -220,6 +272,42 @@ class TestPipeline(unittest.TestCase):
         # But DB status is not written
         norm_url = normalize_url("https://example.com/nodb")
         self.assertIsNone(get_article_status(norm_url, self.temp_db_path))
+
+    # --- Test 13: RSS fetch failure ---
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_run_source_fetch_failure(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = []
+        source = {"name": "Failed Fetch Source", "url": "https://example.com/rss-fail"}
+        result = run_source(source, db_path=self.temp_db_path)
+        mock_fetch.assert_called_once_with("https://example.com/rss-fail", timeout=10)
+        mock_parse.assert_not_called()
+        mock_extract.assert_not_called()
+        self.assertEqual(result, [])
+
+    # --- Test 14: Empty parsed entries ---
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_run_source_empty_parsed_entries(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = []
+        source = {"name": "Parse Fail Source", "url": "https://example.com/rss-parse-fail"}
+        result = run_source(source, db_path=self.temp_db_path)
+        mock_fetch.assert_called_once_with("https://example.com/rss-parse-fail", timeout=10)
+        mock_parse.assert_called_once_with([{"raw": "data"}])
+        mock_extract.assert_not_called()
+        self.assertEqual(result, [])
+
+    # --- Test 15: Invalid source input ---
+    @patch("pipeline.fetch_rss")
+    def test_run_source_invalid_source_input(self, mock_fetch):
+        self.assertEqual(run_source(None, db_path=self.temp_db_path), [])
+        self.assertEqual(run_source("not a dict", db_path=self.temp_db_path), [])
+        self.assertEqual(run_source({"name": "No URL"}, db_path=self.temp_db_path), [])
+        self.assertEqual(run_source({"name": "Empty URL", "url": "   "}, db_path=self.temp_db_path), [])
+        mock_fetch.assert_not_called()
 
 
 if __name__ == "__main__":
