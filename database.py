@@ -1,11 +1,16 @@
+from contextlib import contextmanager
 import logging
+import os
 import sqlite3
 import urllib.parse
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "autonews.db"
+DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "autonews.db",
+)
 
 TRACKING_PARAMS = {
     "utm_source",
@@ -106,6 +111,23 @@ def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def db_connection(db_path: str = DEFAULT_DB_PATH):
+    """Context manager yielding a SQLite connection.
+
+    Commits on success, rolls back on exception, and always closes.
+    """
+    conn = get_connection(db_path)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     """Initialize the SQLite database schema and indexes safely.
 
@@ -116,7 +138,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         return
 
     try:
-        with get_connection(db_path) as conn:
+        with db_connection(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS articles (
@@ -137,7 +159,6 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
             """)
-            conn.commit()
     except Exception as exc:
         logger.error("Failed to initialize database at %s: %s", db_path, exc)
         raise
@@ -158,7 +179,7 @@ def get_article_status(normalized_url: str, db_path: str = DEFAULT_DB_PATH) -> O
         return None
 
     try:
-        with get_connection(db_path) as conn:
+        with db_connection(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT status FROM articles WHERE normalized_url = ?",
@@ -208,7 +229,7 @@ def record_article(
         return
 
     try:
-        with get_connection(db_path) as conn:
+        with db_connection(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -224,7 +245,6 @@ def record_article(
                 """,
                 (url, normalized_url, source_name, title, status, error_message),
             )
-            conn.commit()
     except Exception as exc:
         logger.error("Failed to record article %s in DB: %s", normalized_url, exc)
 
@@ -249,7 +269,7 @@ def mark_article_status(
         return
 
     try:
-        with get_connection(db_path) as conn:
+        with db_connection(db_path) as conn:
             cursor = conn.cursor()
             if title:
                 cursor.execute(
@@ -269,6 +289,5 @@ def mark_article_status(
                     """,
                     (status, error_message, normalized_url),
                 )
-            conn.commit()
     except Exception as exc:
         logger.error("Failed to update status for article %s: %s", normalized_url, exc)
