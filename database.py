@@ -1,9 +1,10 @@
 from contextlib import contextmanager
+import json
 import logging
 import os
 import sqlite3
 import urllib.parse
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ TRACKING_PARAMS = {
     "ref",
     "referrer",
 }
+
+VALID_STATUSES = ("pending", "completed", "failed")
 
 
 def normalize_url(url: str) -> str:
@@ -149,15 +152,38 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                     title TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     error_message TEXT,
+                    article_data TEXT,
+                    research_data TEXT,
+                    research_status TEXT NOT NULL DEFAULT 'pending',
+                    publish_status TEXT NOT NULL DEFAULT 'pending',
                     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # Run idempotent schema migrations for existing databases
+            existing_cols = {row["name"] for row in cursor.execute("PRAGMA table_info(articles)").fetchall()}
+
+            if "article_data" not in existing_cols:
+                cursor.execute("ALTER TABLE articles ADD COLUMN article_data TEXT;")
+            if "research_data" not in existing_cols:
+                cursor.execute("ALTER TABLE articles ADD COLUMN research_data TEXT;")
+            if "research_status" not in existing_cols:
+                cursor.execute("ALTER TABLE articles ADD COLUMN research_status TEXT NOT NULL DEFAULT 'pending';")
+            if "publish_status" not in existing_cols:
+                cursor.execute("ALTER TABLE articles ADD COLUMN publish_status TEXT NOT NULL DEFAULT 'pending';")
+
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_articles_normalized_url ON articles(normalized_url);
             """)
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_articles_research_status ON articles(research_status);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_articles_publish_status ON articles(publish_status);
             """)
     except Exception as exc:
         logger.error("Failed to initialize database at %s: %s", db_path, exc)
@@ -291,3 +317,215 @@ def mark_article_status(
                 )
     except Exception as exc:
         logger.error("Failed to update status for article %s: %s", normalized_url, exc)
+
+
+def save_article_data(normalized_url: str, data: dict, db_path: str = DEFAULT_DB_PATH) -> None:
+    """Persist JSON serialized extracted article data."""
+    if not db_path or not normalized_url or data is None:
+        return
+
+    try:
+        json_str = json.dumps(data, ensure_ascii=False)
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE articles
+                SET article_data = ?, last_seen = CURRENT_TIMESTAMP
+                WHERE normalized_url = ?;
+                """,
+                (json_str, normalized_url),
+            )
+    except Exception as exc:
+        logger.error("Failed to save article_data for %s: %s", normalized_url, exc)
+
+
+def save_research_data(normalized_url: str, data: dict, db_path: str = DEFAULT_DB_PATH) -> None:
+    """Persist JSON serialized research article data."""
+    if not db_path or not normalized_url or data is None:
+        return
+
+    try:
+        json_str = json.dumps(data, ensure_ascii=False)
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE articles
+                SET research_data = ?, last_seen = CURRENT_TIMESTAMP
+                WHERE normalized_url = ?;
+                """,
+                (json_str, normalized_url),
+            )
+    except Exception as exc:
+        logger.error("Failed to save research_data for %s: %s", normalized_url, exc)
+
+
+def get_article_data(normalized_url: str, db_path: str = DEFAULT_DB_PATH) -> Optional[dict]:
+    """Retrieve parsed JSON article_data dict."""
+    if not db_path or not normalized_url:
+        return None
+
+    try:
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT article_data FROM articles WHERE normalized_url = ?",
+                (normalized_url,),
+            )
+            row = cursor.fetchone()
+            if row and row["article_data"]:
+                return json.loads(row["article_data"])
+            return None
+    except Exception as exc:
+        logger.error("Failed to get article_data for %s: %s", normalized_url, exc)
+        return None
+
+
+def get_research_data(normalized_url: str, db_path: str = DEFAULT_DB_PATH) -> Optional[dict]:
+    """Retrieve parsed JSON research_data dict."""
+    if not db_path or not normalized_url:
+        return None
+
+    try:
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT research_data FROM articles WHERE normalized_url = ?",
+                (normalized_url,),
+            )
+            row = cursor.fetchone()
+            if row and row["research_data"]:
+                return json.loads(row["research_data"])
+            return None
+    except Exception as exc:
+        logger.error("Failed to get research_data for %s: %s", normalized_url, exc)
+        return None
+
+
+def mark_research_status(
+    normalized_url: str,
+    status: str,
+    error_message: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Update research status for an article."""
+    if status not in VALID_STATUSES:
+        raise ValueError(f"Invalid research status: {status}")
+
+    if not db_path or not normalized_url:
+        return
+
+    try:
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE articles
+                SET research_status = ?, error_message = ?, last_seen = CURRENT_TIMESTAMP
+                WHERE normalized_url = ?;
+                """,
+                (status, error_message, normalized_url),
+            )
+    except Exception as exc:
+        logger.error("Failed to mark research_status for %s: %s", normalized_url, exc)
+
+
+def mark_publish_status(
+    normalized_url: str,
+    status: str,
+    error_message: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Update publish status for an article."""
+    if status not in VALID_STATUSES:
+        raise ValueError(f"Invalid publish status: {status}")
+
+    if not db_path or not normalized_url:
+        return
+
+    try:
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE articles
+                SET publish_status = ?, error_message = ?, last_seen = CURRENT_TIMESTAMP
+                WHERE normalized_url = ?;
+                """,
+                (status, error_message, normalized_url),
+            )
+    except Exception as exc:
+        logger.error("Failed to mark publish_status for %s: %s", normalized_url, exc)
+
+
+def get_pending_research(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Return articles that need research (research_status IN ('pending', 'failed')), where extraction is completed."""
+    if not db_path:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    try:
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT url, normalized_url, title, article_data
+                FROM articles
+                WHERE status = 'completed' AND research_status IN ('pending', 'failed');
+                """
+            )
+            rows = cursor.fetchall()
+            for row in rows:
+                parsed_data = None
+                if row["article_data"]:
+                    try:
+                        parsed_data = json.loads(row["article_data"])
+                    except Exception:
+                        pass
+                results.append({
+                    "url": row["url"],
+                    "normalized_url": row["normalized_url"],
+                    "title": row["title"],
+                    "article_data": parsed_data,
+                })
+    except Exception as exc:
+        logger.error("Failed to query get_pending_research: %s", exc)
+
+    return results
+
+
+def get_pending_publish(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Return articles that need publish (publish_status IN ('pending', 'failed')), where research_status = 'completed'."""
+    if not db_path:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    try:
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT url, normalized_url, title, research_data
+                FROM articles
+                WHERE research_status = 'completed' AND publish_status IN ('pending', 'failed');
+                """
+            )
+            rows = cursor.fetchall()
+            for row in rows:
+                parsed_data = None
+                if row["research_data"]:
+                    try:
+                        parsed_data = json.loads(row["research_data"])
+                    except Exception:
+                        pass
+                results.append({
+                    "url": row["url"],
+                    "normalized_url": row["normalized_url"],
+                    "title": row["title"],
+                    "research_data": parsed_data,
+                })
+    except Exception as exc:
+        logger.error("Failed to query get_pending_publish: %s", exc)
+
+    return results

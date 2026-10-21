@@ -10,6 +10,7 @@ from database import (
     normalize_url,
     record_article,
     mark_article_status,
+    save_article_data,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,7 @@ def run_source(
                         title=extracted.get("title"),
                         db_path=db_path,
                     )
+                    save_article_data(norm_url, extracted, db_path=db_path)
                 extracted_articles.append(extracted)
             else:
                 logger.warning("Extraction failed for article URL: %s", raw_url)

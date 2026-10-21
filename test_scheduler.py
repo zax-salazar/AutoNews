@@ -1,6 +1,20 @@
+import os
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
-from database import DEFAULT_DB_PATH
+from database import (
+    DEFAULT_DB_PATH,
+    init_db,
+    is_article_completed,
+    get_article_status,
+    get_article_data,
+    save_article_data,
+    save_research_data,
+    mark_research_status,
+    mark_publish_status,
+    record_article,
+    normalize_url,
+)
 from publisher import NullPublisher
 from research import NullProvider
 from scheduler import (
@@ -12,6 +26,15 @@ from scheduler import (
 
 
 class TestScheduler(unittest.TestCase):
+
+    def setUp(self):
+        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
+        init_db(self.temp_db_path)
+
+    def tearDown(self):
+        os.close(self.temp_db_fd)
+        if os.path.exists(self.temp_db_path):
+            os.remove(self.temp_db_path)
 
     # --- run_once basics ---
     def test_run_once_empty_sources(self):
@@ -55,7 +78,7 @@ class TestScheduler(unittest.TestCase):
         pub = NullPublisher()
         sources = [{"name": "S1"}]
 
-        summary = run_once(sources, llm, pub)
+        summary = run_once(sources, llm, pub, db_path=self.temp_db_path)
 
         self.assertEqual(summary["extracted"], 2)
         self.assertEqual(summary["researched"], 2)
@@ -80,7 +103,7 @@ class TestScheduler(unittest.TestCase):
         ]
         mock_publish.return_value = {"ok": True, "id": "x", "error": None}
 
-        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher())
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
 
         self.assertEqual(summary["extracted"], 2)
         self.assertEqual(summary["researched"], 1)
@@ -95,7 +118,7 @@ class TestScheduler(unittest.TestCase):
         mock_run_sources.return_value = [{"title": "Art 1", "url": "U1"}]
         mock_research.side_effect = RuntimeError("Research crash")
 
-        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher())
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
 
         self.assertEqual(summary["extracted"], 1)
         self.assertEqual(summary["researched"], 0)
@@ -111,7 +134,7 @@ class TestScheduler(unittest.TestCase):
         mock_research.return_value = {"title": "Res 1", "body": "B1"}
         mock_publish.return_value = {"ok": False, "id": None, "error": "Publish error"}
 
-        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher())
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
 
         self.assertEqual(summary["extracted"], 1)
         self.assertEqual(summary["researched"], 1)
@@ -126,7 +149,7 @@ class TestScheduler(unittest.TestCase):
         mock_research.return_value = {"title": "Res 1", "body": "B1"}
         mock_publish.side_effect = RuntimeError("Publish crash")
 
-        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher())
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
 
         self.assertEqual(summary["extracted"], 1)
         self.assertEqual(summary["researched"], 1)
@@ -144,7 +167,7 @@ class TestScheduler(unittest.TestCase):
         mock_research.return_value = {"title": "Res", "body": "B"}
         mock_publish.return_value = {"ok": True, "id": "x", "error": None}
 
-        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), limit=2)
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), db_path=self.temp_db_path, limit=2)
 
         self.assertEqual(summary["extracted"], 5)
         self.assertEqual(summary["researched"], 2)
@@ -162,7 +185,7 @@ class TestScheduler(unittest.TestCase):
         mock_research.return_value = {"title": "Res", "body": "B"}
         mock_publish.return_value = {"ok": True, "id": "x", "error": None}
 
-        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), limit=0)
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), db_path=self.temp_db_path, limit=0)
 
         self.assertEqual(summary["extracted"], 3)
         self.assertEqual(summary["researched"], 3)
@@ -263,6 +286,102 @@ class TestScheduler(unittest.TestCase):
         exit_code = main(["--source", "nonexistent"])
         self.assertEqual(exit_code, 1)
         mock_run_once.assert_not_called()
+
+    # --- New persistence retry tests ---
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_retries_failed_research(self, mock_publish, mock_research, mock_run_sources):
+        mock_run_sources.return_value = []
+        norm_url = normalize_url("https://example.com/retry-res")
+        art_data = {"title": "Pre-seeded", "url": "https://example.com/retry-res"}
+
+        record_article("https://example.com/retry-res", norm_url, status="completed", db_path=self.temp_db_path)
+        save_article_data(norm_url, art_data, db_path=self.temp_db_path)
+        mark_research_status(norm_url, "failed", error_message="Previous error", db_path=self.temp_db_path)
+
+        mock_research.return_value = {"title": "Res", "body": "B"}
+        mock_publish.return_value = {"ok": True, "id": "p1", "error": None}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
+
+        self.assertEqual(summary["researched"], 1)
+        self.assertEqual(summary["published"], 1)
+        mock_research.assert_called_once_with(art_data, unittest.mock.ANY, target_language="fa")
+
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_retries_failed_publish(self, mock_publish, mock_research, mock_run_sources):
+        mock_run_sources.return_value = []
+        norm_url = normalize_url("https://example.com/retry-pub")
+
+        record_article("https://example.com/retry-pub", norm_url, status="completed", db_path=self.temp_db_path)
+        mark_research_status(norm_url, "completed", db_path=self.temp_db_path)
+        save_research_data(norm_url, {"title": "Res", "body": "B"}, db_path=self.temp_db_path)
+        mark_publish_status(norm_url, "failed", error_message="Previous pub error", db_path=self.temp_db_path)
+
+        mock_publish.return_value = {"ok": True, "id": "p2", "error": None}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
+
+        self.assertEqual(summary["researched"], 0)
+        self.assertEqual(summary["published"], 1)
+        mock_research.assert_not_called()
+        mock_publish.assert_called_once_with({"title": "Res", "body": "B"}, unittest.mock.ANY)
+
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_skips_completed_articles(self, mock_publish, mock_research, mock_run_sources):
+        mock_run_sources.return_value = []
+        norm_url = normalize_url("https://example.com/done")
+
+        record_article("https://example.com/done", norm_url, status="completed", db_path=self.temp_db_path)
+        mark_research_status(norm_url, "completed", db_path=self.temp_db_path)
+        mark_publish_status(norm_url, "completed", db_path=self.temp_db_path)
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
+
+        self.assertEqual(summary["researched"], 0)
+        self.assertEqual(summary["published"], 0)
+        mock_research.assert_not_called()
+        mock_publish.assert_not_called()
+
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_limit_only_affects_new_extractions(self, mock_publish, mock_research, mock_run_sources):
+        norm_url_retry = normalize_url("https://example.com/retry-res-item")
+        art_retry = {"title": "Retry", "url": "https://example.com/retry-res-item"}
+        record_article("https://example.com/retry-res-item", norm_url_retry, status="completed", db_path=self.temp_db_path)
+        save_article_data(norm_url_retry, art_retry, db_path=self.temp_db_path)
+        mark_research_status(norm_url_retry, "failed", db_path=self.temp_db_path)
+
+        mock_run_sources.return_value = [
+            {"title": f"New {i}", "url": f"https://example.com/new-{i}"} for i in range(3)
+        ]
+        mock_research.return_value = {"title": "Res", "body": "B"}
+        mock_publish.return_value = {"ok": True, "id": "p", "error": None}
+
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), limit=1, db_path=self.temp_db_path)
+
+        self.assertEqual(summary["extracted"], 3)
+        self.assertEqual(summary["researched"], 2)  # 1 retry + 1 new
+        self.assertEqual(summary["published"], 2)
+
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_none_db_path_skips_retries(self, mock_publish, mock_research, mock_run_sources):
+        mock_run_sources.return_value = []
+        summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), db_path=None)
+
+        self.assertEqual(summary["extracted"], 0)
+        self.assertEqual(summary["researched"], 0)
+        self.assertEqual(summary["published"], 0)
+        mock_research.assert_not_called()
+        mock_publish.assert_not_called()
 
 
 if __name__ == "__main__":

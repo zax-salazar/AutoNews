@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 from pipeline import run_source, run_sources
-from database import init_db, is_article_completed, get_article_status, normalize_url
+from database import init_db, is_article_completed, get_article_status, get_article_data, normalize_url
 
 
 class TestPipeline(unittest.TestCase):
@@ -49,6 +49,38 @@ class TestPipeline(unittest.TestCase):
 
         norm_url = normalize_url("https://example.com/1?utm_source=rss")
         self.assertTrue(is_article_completed(norm_url, db_path=self.temp_db_path))
+
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_run_source_saves_article_data(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = [{"title": "Saved Art", "url": "https://example.com/save-data"}]
+        mock_extracted = {"title": "Saved Art", "url": "https://example.com/save-data", "content": "Text", "blocks": []}
+        mock_extract.return_value = mock_extracted
+
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
+
+        run_source(source, db_path=self.temp_db_path)
+
+        norm_url = normalize_url("https://example.com/save-data")
+        saved_data = get_article_data(norm_url, db_path=self.temp_db_path)
+        self.assertEqual(saved_data, mock_extracted)
+
+    @patch("pipeline.extract_article")
+    @patch("pipeline.parse_entries")
+    @patch("pipeline.fetch_rss")
+    def test_run_source_extraction_failure_does_not_save_article_data(self, mock_fetch, mock_parse, mock_extract):
+        mock_fetch.return_value = [{"raw": "data"}]
+        mock_parse.return_value = [{"title": "Fail Art", "url": "https://example.com/fail-data"}]
+        mock_extract.return_value = None
+
+        source = {"name": "Test Source", "url": "https://example.com/rss"}
+
+        run_source(source, db_path=self.temp_db_path)
+
+        norm_url = normalize_url("https://example.com/fail-data")
+        self.assertIsNone(get_article_data(norm_url, db_path=self.temp_db_path))
 
     # --- Test 2: Completed article skipped on subsequent runs ---
     @patch("pipeline.extract_article")
@@ -175,8 +207,6 @@ class TestPipeline(unittest.TestCase):
 
     def test_orphan_processing_article_is_retried(self):
         """A prior crashed run leaves status='processing'; next run must retry."""
-        # Simulate the crashed previous run: record the article as 'processing'
-        # and never transition it to 'completed' or 'failed'.
         norm_url = normalize_url("https://example.com/crashed-article")
 
         from database import record_article
@@ -187,7 +217,6 @@ class TestPipeline(unittest.TestCase):
             db_path=self.temp_db_path,
         )
 
-        # Sanity: the record really is in 'processing', not 'completed'
         self.assertEqual(
             get_article_status(norm_url, self.temp_db_path),
             "processing",
@@ -215,11 +244,9 @@ class TestPipeline(unittest.TestCase):
             source = {"name": "Test Source", "url": "https://example.com/rss"}
             results = run_source(source, db_path=self.temp_db_path)
 
-        # The retry must have actually run
         self.assertEqual(len(results), 1)
         self.assertEqual(mock_extract.call_count, 1)
 
-        # And the final status must now be 'completed'
         self.assertEqual(
             get_article_status(norm_url, self.temp_db_path),
             "completed",
