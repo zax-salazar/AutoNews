@@ -1,2 +1,14 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Virtualenv
+.venv/
+
+# Local database
+autonews.db
+*.db-journal
+
+# Local test fixtures (copyrighted publisher HTML, kept locally only)
+pcgamer_test.html
