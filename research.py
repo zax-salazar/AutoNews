@@ -3,10 +3,34 @@ import json
 import logging
 import os
 import re
+import time as _time
 from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 logger = logging.getLogger(__name__)
+
+BASE_RETRY_SECONDS = 5.0
+
+
+def _backoff(attempt: int, retry_after_header) -> float:
+    """Sleep and return the number of seconds slept.
+    - If retry_after_header is a valid non-negative number of seconds,
+      sleep min(float(value), 60.0).
+    - Otherwise sleep BASE_RETRY_SECONDS * (2 ** attempt), capped at 40.
+    Never raises.
+    """
+    if retry_after_header is not None:
+        try:
+            secs = float(retry_after_header)
+            if secs >= 0:
+                secs = min(secs, 60.0)
+                _time.sleep(secs)
+                return secs
+        except (TypeError, ValueError):
+            pass
+    secs = min(BASE_RETRY_SECONDS * (2 ** attempt), 40.0)
+    _time.sleep(secs)
+    return secs
 
 
 class LLMProvider(ABC):
@@ -34,24 +58,30 @@ class GeminiProvider(LLMProvider):
         api_key: str,
         model: str = "gemini-2.0-flash",
         timeout: int = 60,
+        max_retries: int = 3,
     ):
         if not api_key:
-            raise ValueError("API key must be provided for GeminiProvider.")
+            raise ValueError("GeminiProvider requires a non-empty api_key")
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.max_retries = max_retries
 
-    def generate(self, prompt: str, system: Optional[str] = None) -> str:
-        url = (
+    def _build_url(self) -> str:
+        return (
             f"https://generativelanguage.googleapis.com/v1beta/"
             f"models/{self.model}:generateContent?key={self.api_key}"
         )
+
+    def _build_body(self, prompt: str, system: Optional[str] = None) -> Dict[str, Any]:
         parts: List[Dict[str, str]] = []
         if system:
             parts.append({"text": system})
         parts.append({"text": prompt})
 
-        body = {
+        return {
             "contents": [{"parts": parts}],
             "generationConfig": {
                 "response_mime_type": "application/json",
@@ -59,21 +89,66 @@ class GeminiProvider(LLMProvider):
             },
         }
 
-        try:
-            response = requests.post(url, json=body, timeout=self.timeout)
-            response.raise_for_status()
-            res_json = response.json()
-            candidates = res_json.get("candidates", [])
-            if not candidates:
-                raise RuntimeError("Gemini API response contained no candidates.")
-            content = candidates[0].get("content", {})
-            res_parts = content.get("parts", [])
-            if not res_parts:
-                raise RuntimeError("Gemini API candidate contained no content parts.")
-            return res_parts[0].get("text", "")
-        except Exception as exc:
-            logger.error("Gemini API request failed: %s", exc)
-            raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+    def _parse_success(self, response: requests.Response) -> str:
+        res_json = response.json()
+        candidates = res_json.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini API response contained no candidates.")
+        content = candidates[0].get("content", {})
+        res_parts = content.get("parts", [])
+        if not res_parts:
+            raise RuntimeError("Gemini API candidate contained no content parts.")
+        return res_parts[0].get("text", "")
+
+    def generate(self, prompt: str, system: Optional[str] = None) -> str:
+        last_exc = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = requests.post(
+                    self._build_url(),
+                    json=self._build_body(prompt, system),
+                    headers={
+                        "x-goog-api-key": self.api_key,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < self.max_retries:
+                    slept = _backoff(attempt, None)
+                    logger.warning(
+                        "Gemini API network error: %s; retry %d/%d after %.1fs",
+                        exc, attempt + 1, self.max_retries, slept,
+                    )
+                    continue
+                raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+
+            status = response.status_code
+
+            if status in (429, 500, 502, 503, 504):
+                if attempt < self.max_retries:
+                    retry_after = response.headers.get("Retry-After")
+                    slept = _backoff(attempt, retry_after)
+                    logger.warning(
+                        "Gemini API returned %d; retry %d/%d after %.1fs",
+                        status, attempt + 1, self.max_retries, slept,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"Gemini API request failed: {status} {response.reason}"
+                )
+
+            if status >= 400:
+                raise RuntimeError(
+                    f"Gemini API request failed: {status} {response.reason}"
+                )
+
+            return self._parse_success(response)
+
+        raise RuntimeError(
+            f"Gemini API request failed: {last_exc or 'retries exhausted'}"
+        )
 
 
 class NullProvider(LLMProvider):
@@ -113,7 +188,8 @@ def get_default_provider() -> LLMProvider:
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is required for gemini provider.")
         model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-        return GeminiProvider(api_key=api_key, model=model)
+        max_retries = int(os.environ.get("AUTONEWS_LLM_MAX_RETRIES", "3"))
+        return GeminiProvider(api_key=api_key, model=model, max_retries=max_retries)
 
     raise ValueError(f"Unknown LLM provider type: {provider_type}")
 

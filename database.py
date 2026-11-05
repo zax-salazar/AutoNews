@@ -156,6 +156,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                     research_data TEXT,
                     research_status TEXT NOT NULL DEFAULT 'pending',
                     publish_status TEXT NOT NULL DEFAULT 'pending',
+                    researched_at TIMESTAMP,
                     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -172,6 +173,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 cursor.execute("ALTER TABLE articles ADD COLUMN research_status TEXT NOT NULL DEFAULT 'pending';")
             if "publish_status" not in existing_cols:
                 cursor.execute("ALTER TABLE articles ADD COLUMN publish_status TEXT NOT NULL DEFAULT 'pending';")
+            if "researched_at" not in existing_cols:
+                cursor.execute("ALTER TABLE articles ADD COLUMN researched_at TIMESTAMP;")
 
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_articles_normalized_url ON articles(normalized_url);
@@ -419,16 +422,52 @@ def mark_research_status(
     try:
         with db_connection(db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE articles
-                SET research_status = ?, error_message = ?, last_seen = CURRENT_TIMESTAMP
-                WHERE normalized_url = ?;
-                """,
-                (status, error_message, normalized_url),
-            )
+            if status == "completed":
+                cursor.execute(
+                    """
+                    UPDATE articles
+                    SET research_status = ?, error_message = ?, researched_at = CURRENT_TIMESTAMP, last_seen = CURRENT_TIMESTAMP
+                    WHERE normalized_url = ?;
+                    """,
+                    (status, error_message, normalized_url),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE articles
+                    SET research_status = ?, error_message = ?, last_seen = CURRENT_TIMESTAMP
+                    WHERE normalized_url = ?;
+                    """,
+                    (status, error_message, normalized_url),
+                )
     except Exception as exc:
         logger.error("Failed to mark research_status for %s: %s", normalized_url, exc)
+
+
+def count_researched_today(db_path: str = DEFAULT_DB_PATH) -> int:
+    """Number of articles whose research completed today (UTC).
+    Returns 0 on db_path falsy, missing table, or any SQL error
+    (log via logger.warning but do not raise).
+    """
+    if not db_path:
+        return 0
+
+    try:
+        with db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM articles
+                WHERE research_status = 'completed'
+                  AND researched_at IS NOT NULL
+                  AND date(researched_at) = date('now');
+                """
+            )
+            row = cursor.fetchone()
+            return row[0] if row else 0
+    except Exception as exc:
+        logger.warning("Failed to count researched today for DB %s: %s", db_path, exc)
+        return 0
 
 
 def mark_publish_status(
