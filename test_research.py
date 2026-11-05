@@ -106,6 +106,7 @@ class TestResearch(unittest.TestCase):
     @patch("research.requests.post")
     def test_gemini_provider_builds_request(self, mock_post):
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "candidates": [
                 {"content": {"parts": [{"text": '{"title": "Gemini Title"}'}]}}
@@ -128,8 +129,9 @@ class TestResearch(unittest.TestCase):
         self.assertEqual(parts[1]["text"], "Prompt text")
         self.assertEqual(res, '{"title": "Gemini Title"}')
 
+    @patch("research._time.sleep")
     @patch("research.requests.post")
-    def test_gemini_provider_handles_http_error(self, mock_post):
+    def test_gemini_provider_handles_http_error(self, mock_post, mock_sleep):
         mock_post.side_effect = requests.RequestException("HTTP Connection Error")
         provider = GeminiProvider(api_key="test-key")
 
@@ -224,6 +226,220 @@ class TestResearch(unittest.TestCase):
         provider = get_default_provider()
         self.assertIsInstance(provider, GeminiProvider)
         self.assertEqual(provider.api_key, "test-key-999")
+
+    # --- Retry and Backoff Tests ---
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_retries_on_429(self, mock_post, mock_sleep):
+        res_429 = MagicMock()
+        res_429.status_code = 429
+        res_429.headers = {}
+        res_429.reason = "Too Many Requests"
+
+        res_200 = MagicMock()
+        res_200.status_code = 200
+        res_200.json.return_value = {
+            "candidates": [
+                {"content": {"parts": [{"text": "Success after 429"}]}}
+            ]
+        }
+
+        mock_post.side_effect = [res_429, res_200]
+
+        provider = GeminiProvider(api_key="test-key", max_retries=2)
+        out = provider.generate("Prompt")
+
+        self.assertEqual(out, "Success after 429")
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(5.0)
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_retries_on_503(self, mock_post, mock_sleep):
+        res_503 = MagicMock()
+        res_503.status_code = 503
+        res_503.headers = {}
+        res_503.reason = "Service Unavailable"
+
+        res_200 = MagicMock()
+        res_200.status_code = 200
+        res_200.json.return_value = {
+            "candidates": [
+                {"content": {"parts": [{"text": "Success after 503"}]}}
+            ]
+        }
+
+        mock_post.side_effect = [res_503, res_200]
+
+        provider = GeminiProvider(api_key="test-key", max_retries=3)
+        out = provider.generate("Prompt")
+
+        self.assertEqual(out, "Success after 503")
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(5.0)
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_retries_on_500(self, mock_post, mock_sleep):
+        res_500 = MagicMock()
+        res_500.status_code = 500
+        res_500.headers = {}
+        res_500.reason = "Internal Server Error"
+
+        res_200 = MagicMock()
+        res_200.status_code = 200
+        res_200.json.return_value = {
+            "candidates": [
+                {"content": {"parts": [{"text": "Success after 500"}]}}
+            ]
+        }
+
+        mock_post.side_effect = [res_500, res_200]
+
+        provider = GeminiProvider(api_key="test-key", max_retries=3)
+        out = provider.generate("Prompt")
+
+        self.assertEqual(out, "Success after 500")
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(5.0)
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_respects_retry_after_header(self, mock_post, mock_sleep):
+        res_429 = MagicMock()
+        res_429.status_code = 429
+        res_429.headers = {"Retry-After": "12.5"}
+        res_429.reason = "Too Many Requests"
+
+        res_200 = MagicMock()
+        res_200.status_code = 200
+        res_200.json.return_value = {
+            "candidates": [
+                {"content": {"parts": [{"text": "Success after Retry-After"}]}}
+            ]
+        }
+
+        mock_post.side_effect = [res_429, res_200]
+
+        provider = GeminiProvider(api_key="test-key", max_retries=2)
+        out = provider.generate("Prompt")
+
+        self.assertEqual(out, "Success after Retry-After")
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(12.5)
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_fails_after_max_retries(self, mock_post, mock_sleep):
+        res_429 = MagicMock()
+        res_429.status_code = 429
+        res_429.headers = {}
+        res_429.reason = "Too Many Requests"
+
+        mock_post.return_value = res_429
+
+        provider = GeminiProvider(api_key="test-key", max_retries=2)
+        with self.assertRaises(RuntimeError) as ctx:
+            provider.generate("Prompt")
+
+        self.assertIn("429 Too Many Requests", str(ctx.exception))
+        # Initial call + 2 retries = 3 calls
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+        mock_sleep.assert_has_calls([unittest.mock.call(5.0), unittest.mock.call(10.0)])
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_does_not_retry_on_400(self, mock_post, mock_sleep):
+        res_400 = MagicMock()
+        res_400.status_code = 400
+        res_400.reason = "Bad Request"
+        mock_post.return_value = res_400
+
+        provider = GeminiProvider(api_key="test-key", max_retries=3)
+        with self.assertRaises(RuntimeError) as ctx:
+            provider.generate("Prompt")
+
+        self.assertIn("400 Bad Request", str(ctx.exception))
+        self.assertEqual(mock_post.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_does_not_retry_on_401(self, mock_post, mock_sleep):
+        res_401 = MagicMock()
+        res_401.status_code = 401
+        res_401.reason = "Unauthorized"
+        mock_post.return_value = res_401
+
+        provider = GeminiProvider(api_key="test-key", max_retries=3)
+        with self.assertRaises(RuntimeError) as ctx:
+            provider.generate("Prompt")
+
+        self.assertIn("401 Unauthorized", str(ctx.exception))
+        self.assertEqual(mock_post.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_does_not_retry_on_403(self, mock_post, mock_sleep):
+        res_403 = MagicMock()
+        res_403.status_code = 403
+        res_403.reason = "Forbidden"
+        mock_post.return_value = res_403
+
+        provider = GeminiProvider(api_key="test-key", max_retries=3)
+        with self.assertRaises(RuntimeError) as ctx:
+            provider.generate("Prompt")
+
+        self.assertIn("403 Forbidden", str(ctx.exception))
+        self.assertEqual(mock_post.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_network_error_is_retried(self, mock_post, mock_sleep):
+        res_200 = MagicMock()
+        res_200.status_code = 200
+        res_200.json.return_value = {
+            "candidates": [
+                {"content": {"parts": [{"text": "Recovered from network drop"}]}}
+            ]
+        }
+
+        mock_post.side_effect = [
+            requests.ConnectionError("Connection dropped"),
+            res_200,
+        ]
+
+        provider = GeminiProvider(api_key="test-key", max_retries=2)
+        out = provider.generate("Prompt")
+
+        self.assertEqual(out, "Recovered from network drop")
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(5.0)
+
+    @patch.dict(os.environ, {"AUTONEWS_LLM_PROVIDER": "gemini", "GEMINI_API_KEY": "test-key-999", "AUTONEWS_LLM_MAX_RETRIES": "5"}, clear=True)
+    def test_gemini_provider_respects_max_retries_env(self):
+        provider = get_default_provider()
+        self.assertIsInstance(provider, GeminiProvider)
+        self.assertEqual(provider.max_retries, 5)
+
+    @patch("research._time.sleep")
+    @patch("research.requests.post")
+    def test_gemini_provider_max_retries_zero_means_no_retry(self, mock_post, mock_sleep):
+        res_500 = MagicMock()
+        res_500.status_code = 500
+        res_500.reason = "Internal Server Error"
+        mock_post.return_value = res_500
+
+        provider = GeminiProvider(api_key="test-key", max_retries=0)
+        with self.assertRaises(RuntimeError) as ctx:
+            provider.generate("Prompt")
+
+        self.assertIn("500 Internal Server Error", str(ctx.exception))
+        self.assertEqual(mock_post.call_count, 1)
+        mock_sleep.assert_not_called()
 
 
 if __name__ == "__main__":

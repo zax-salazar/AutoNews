@@ -60,10 +60,11 @@ class TestScheduler(unittest.TestCase):
             run_once([{"name": "A"}], llm, None)
 
     # --- happy path ---
+    @patch("scheduler.time.sleep")
     @patch("scheduler.pipeline.run_sources")
     @patch("scheduler.research.research_article")
     @patch("scheduler.publisher.publish_article")
-    def test_run_once_happy_path(self, mock_publish, mock_research, mock_run_sources):
+    def test_run_once_happy_path(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
         mock_run_sources.return_value = [
             {"title": "Art 1", "url": "U1"},
             {"title": "Art 2", "url": "U2"},
@@ -157,10 +158,11 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(summary["publish_failures"], 1)
 
     # --- limit ---
+    @patch("scheduler.time.sleep")
     @patch("scheduler.pipeline.run_sources")
     @patch("scheduler.research.research_article")
     @patch("scheduler.publisher.publish_article")
-    def test_run_once_limit_truncates(self, mock_publish, mock_research, mock_run_sources):
+    def test_run_once_limit_truncates(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
         mock_run_sources.return_value = [
             {"title": f"Art {i}", "url": f"U{i}"} for i in range(5)
         ]
@@ -175,10 +177,11 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(mock_research.call_count, 2)
         self.assertEqual(mock_publish.call_count, 2)
 
+    @patch("scheduler.time.sleep")
     @patch("scheduler.pipeline.run_sources")
     @patch("scheduler.research.research_article")
     @patch("scheduler.publisher.publish_article")
-    def test_run_once_limit_zero_means_no_limit(self, mock_publish, mock_research, mock_run_sources):
+    def test_run_once_limit_zero_means_no_limit(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
         mock_run_sources.return_value = [
             {"title": f"Art {i}", "url": f"U{i}"} for i in range(3)
         ]
@@ -348,10 +351,11 @@ class TestScheduler(unittest.TestCase):
         mock_research.assert_not_called()
         mock_publish.assert_not_called()
 
+    @patch("scheduler.time.sleep")
     @patch("scheduler.pipeline.run_sources")
     @patch("scheduler.research.research_article")
     @patch("scheduler.publisher.publish_article")
-    def test_run_once_limit_only_affects_new_extractions(self, mock_publish, mock_research, mock_run_sources):
+    def test_run_once_limit_only_affects_new_extractions(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
         norm_url_retry = normalize_url("https://example.com/retry-res-item")
         art_retry = {"title": "Retry", "url": "https://example.com/retry-res-item"}
         record_article("https://example.com/retry-res-item", norm_url_retry, status="completed", db_path=self.temp_db_path)
@@ -382,6 +386,154 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(summary["published"], 0)
         mock_research.assert_not_called()
         mock_publish.assert_not_called()
+
+    # --- New tests for pacing delay and daily limit ---
+    @patch.dict(os.environ, {"AUTONEWS_RESEARCH_DELAY": "2.5"}, clear=True)
+    def test_research_delay_env_override(self):
+        from scheduler import _research_delay
+        self.assertEqual(_research_delay(), 2.5)
+
+    @patch.dict(os.environ, {"AUTONEWS_DAILY_LIMIT": "10"}, clear=True)
+    def test_daily_limit_env_override(self):
+        from scheduler import _daily_limit
+        self.assertEqual(_daily_limit(), 10)
+
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_sleeps_between_research_calls(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        mock_run_sources.return_value = [
+            {"title": "Art 1", "url": "U1"},
+            {"title": "Art 2", "url": "U2"},
+            {"title": "Art 3", "url": "U3"},
+        ]
+        mock_research.side_effect = [
+            {"title": "R1", "body": "B1"},
+            {"title": "R2", "body": "B2"},
+            {"title": "R3", "body": "B3"},
+        ]
+        mock_publish.return_value = {"ok": True, "id": "x"}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
+
+        self.assertEqual(summary["researched"], 3)
+        # 3 articles -> 2 sleeps between them
+        self.assertEqual(mock_sleep.call_count, 2)
+        mock_sleep.assert_called_with(4.0)
+
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_does_not_sleep_after_last_article(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        mock_run_sources.return_value = [
+            {"title": "Art 1", "url": "U1"},
+        ]
+        mock_research.return_value = {"title": "R1", "body": "B1"}
+        mock_publish.return_value = {"ok": True, "id": "x"}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
+
+        self.assertEqual(summary["researched"], 1)
+        # Single article -> no sleep
+        mock_sleep.assert_not_called()
+
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_respects_daily_limit(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        mock_run_sources.return_value = [
+            {"title": f"Art {i}", "url": f"https://example.com/art-{i}"} for i in range(5)
+        ]
+        mock_research.return_value = {"title": "R", "body": "B"}
+        mock_publish.return_value = {"ok": True, "id": "x"}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path, daily_limit=2)
+
+        self.assertEqual(summary["researched"], 2)
+        self.assertEqual(mock_research.call_count, 2)
+
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_daily_limit_zero_means_unlimited(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        mock_run_sources.return_value = [
+            {"title": f"Art {i}", "url": f"https://example.com/art-{i}"} for i in range(6)
+        ]
+        mock_research.return_value = {"title": "R", "body": "B"}
+        mock_publish.return_value = {"ok": True, "id": "x"}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path, daily_limit=0)
+
+        self.assertEqual(summary["researched"], 6)
+        self.assertEqual(mock_research.call_count, 6)
+
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_daily_limit_already_reached(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        # Pre-seed 3 completed articles today
+        for i in range(3):
+            url = f"https://example.com/done-{i}"
+            record_article(url, url, status="completed", db_path=self.temp_db_path)
+            mark_research_status(url, "completed", db_path=self.temp_db_path)
+
+        mock_run_sources.return_value = [
+            {"title": "New Art", "url": "https://example.com/new"}
+        ]
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path, daily_limit=3)
+
+        self.assertEqual(summary["researched"], 0)
+        mock_research.assert_not_called()
+
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_failed_research_does_not_count_toward_daily_limit(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        mock_run_sources.return_value = [
+            {"title": "Art 1", "url": "https://example.com/art-1"},
+            {"title": "Art 2", "url": "https://example.com/art-2"},
+        ]
+        # First article fails research, second succeeds
+        mock_research.side_effect = [
+            None,
+            {"title": "R2", "body": "B2"},
+        ]
+        mock_publish.return_value = {"ok": True, "id": "x"}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path, daily_limit=2)
+
+        self.assertEqual(summary["researched"], 1)
+        self.assertEqual(summary["research_failures"], 1)
+        self.assertEqual(mock_research.call_count, 2)
+
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_no_db_path_skips_daily_check(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        mock_run_sources.return_value = [
+            {"title": "Art 1", "url": "https://example.com/art-1"},
+            {"title": "Art 2", "url": "https://example.com/art-2"},
+        ]
+        mock_research.return_value = {"title": "R", "body": "B"}
+        mock_publish.return_value = {"ok": True, "id": "x"}
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=None, daily_limit=1)
+
+        # db_path=None skips the daily cap check
+        self.assertEqual(summary["researched"], 2)
+        self.assertEqual(mock_research.call_count, 2)
+
+    def test_main_accepts_daily_limit_flag(self):
+        args = parse_args(["--daily-limit", "5"])
+        self.assertEqual(args.daily_limit, 5)
 
 
 if __name__ == "__main__":

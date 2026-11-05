@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,6 +15,30 @@ from sources import SOURCES
 logger = logging.getLogger(__name__)
 
 
+def _daily_limit(default: int = 3) -> int:
+    """AUTONEWS_DAILY_LIMIT (default 3). Negative -> 0. Invalid -> default."""
+    val = os.environ.get("AUTONEWS_DAILY_LIMIT")
+    if val is None:
+        return default
+    try:
+        limit = int(val)
+        return max(0, limit)
+    except (TypeError, ValueError):
+        return default
+
+
+def _research_delay(default: float = 4.0) -> float:
+    """AUTONEWS_RESEARCH_DELAY (default 4.0). Negative -> 0.0."""
+    val = os.environ.get("AUTONEWS_RESEARCH_DELAY")
+    if val is None:
+        return default
+    try:
+        delay = float(val)
+        return max(0.0, delay)
+    except (TypeError, ValueError):
+        return default
+
+
 def run_once(
     sources: list,
     llm_provider: Any,
@@ -22,6 +47,8 @@ def run_once(
     db_path: Optional[str] = None,
     target_language: str = "fa",
     limit: Optional[int] = None,
+    *,
+    daily_limit: Optional[int] = None,
 ) -> dict:
     """Run one pass of the pipeline: extract -> research -> publish.
 
@@ -88,8 +115,24 @@ def run_once(
                 seen_queue_urls.add(norm_url)
                 research_queue.append((norm_url, art))
 
-    # Research stage loop
-    for norm_url, art_data in research_queue:
+    # Research stage loop with daily cap and pacing delay
+    if db_path:
+        effective = daily_limit if daily_limit is not None else _daily_limit()
+        already = database.count_researched_today(db_path)
+        remaining = None if effective <= 0 else max(0, effective - already)
+
+        if remaining == 0:
+            logger.warning(
+                "Daily research limit reached (%d/%d) — skipping research",
+                already, effective,
+            )
+            to_research = []
+        else:
+            to_research = research_queue if remaining is None else research_queue[:remaining]
+    else:
+        to_research = research_queue
+
+    for i, (norm_url, art_data) in enumerate(to_research):
         if not art_data or not isinstance(art_data, dict):
             if db_path:
                 database.mark_research_status(
@@ -145,6 +188,10 @@ def run_once(
 
         researched_count += 1
         research_results.append(res_result)
+
+        # On success ONLY, and only when i < len(to_research) - 1:
+        if i < len(to_research) - 1:
+            time.sleep(_research_delay())
 
     # Publish stage query and loop
     if db_path:
@@ -215,6 +262,8 @@ def run_forever(
     target_language: str = "fa",
     limit: Optional[int] = None,
     max_cycles: Optional[int] = None,
+    *,
+    daily_limit: Optional[int] = None,
 ) -> None:
     """Loop run_once execution every interval seconds."""
     if interval <= 0:
@@ -233,6 +282,7 @@ def run_forever(
                 db_path=db_path,
                 target_language=target_language,
                 limit=limit,
+                daily_limit=daily_limit,
             )
         except Exception as exc:
             logger.error("Error encountered in scheduler cycle %d: %s", cycle_count, exc)
@@ -269,6 +319,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Limit number of articles processed per pass.",
+    )
+    parser.add_argument(
+        "--daily-limit",
+        type=int,
+        default=None,
+        help="Daily cap on successfully researched articles (0 = unlimited).",
     )
     parser.add_argument(
         "--interval",
@@ -340,6 +396,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         llm = research.get_default_provider()
         pub = publisher.get_default_publisher()
 
+        daily_lim = args.daily_limit if args.daily_limit is not None else _daily_limit()
+
         if args.interval > 0:
             run_forever(
                 interval=args.interval,
@@ -351,6 +409,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 target_language=args.language,
                 limit=args.limit,
                 max_cycles=args.max_cycles,
+                daily_limit=daily_lim,
             )
             return 0
         else:
@@ -362,6 +421,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 db_path=args.db_path,
                 target_language=args.language,
                 limit=args.limit,
+                daily_limit=daily_lim,
             )
             print(
                 f"Extraction summary: extracted={summary['extracted']}, "
