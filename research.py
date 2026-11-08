@@ -243,6 +243,17 @@ def build_research_prompt(article: Dict[str, Any], target_language: str = "fa") 
     content = article.get("content") or ""
     blocks = article.get("blocks") or []
 
+    images_section = ""
+    image_blocks = [b for b in blocks if isinstance(b, dict) and b.get("type") == "image"]
+    if image_blocks:
+        lines = ["IMAGES IN THE SOURCE (index is the 0-based position in the article's `blocks` list):"]
+        for img_idx, b in enumerate(image_blocks):
+            img_url = b.get("url") or ""
+            img_alt = b.get("alt") or ""
+            img_cap = b.get("caption") or ""
+            lines.append(f"  [{img_idx}] url={img_url} alt={img_alt} caption={img_cap}")
+        images_section = "\n".join(lines) + "\n\n"
+
     prompt = f"""
 You are an expert news analyst and journalist.
 
@@ -253,7 +264,7 @@ URL: {url}
 Content: {content}
 Structured Blocks: {json.dumps(blocks, ensure_ascii=False)}
 
-CRITICAL WRITING REQUIREMENTS:
+{images_section}CRITICAL WRITING REQUIREMENTS:
 1. Target Language: {target_language}
 2. Do NOT translate the source article. You must write an ORIGINAL article in {target_language} based on facts extracted from the source, using your own structure and words.
 3. You do not mention the source publisher or credit any specific news outlet in the output.
@@ -262,6 +273,8 @@ CRITICAL WRITING REQUIREMENTS:
 6. For images, the `body` Persian text may insert image markers in the format [[IMG:i]] where i is the 0-based index into the source article's `blocks` list (only for blocks of type 'image').
 
 OUTPUT FORMAT:
+image_alts MUST be a list of strings whose length exactly equals the number of images listed above. image_alts[i] is a short Persian alt text (max 80 chars) for image i. If you cannot write a meaningful alt text for some image, use an empty string at that position — do NOT omit the entry.
+
 Output STRICT JSON with exactly these keys:
 {{
   "title": "original Persian headline",
@@ -270,7 +283,7 @@ Output STRICT JSON with exactly these keys:
   "seo_description": "original Persian SEO meta description",
   "keywords": ["keyword1", "keyword2"],
   "research_notes": "notes on added context or uncertainties",
-  "image_alts": ["Persian alt text for image at block 0", "Persian alt text for image at block 1"]
+  "image_alts": ["Persian alt text for image 0", "Persian alt text for image 1"]
 }}
 """
     return prompt.strip()
@@ -326,17 +339,29 @@ def research_article(
     out_seo_desc = str(parsed.get("seo_description") or "")
     out_keywords = parsed.get("keywords") if isinstance(parsed.get("keywords"), list) else []
     out_notes = str(parsed.get("research_notes") or "")
-    out_alts = parsed.get("image_alts") if isinstance(parsed.get("image_alts"), list) else []
+
+    blocks = article.get("blocks", [])
+    n_imgs = sum(1 for b in blocks if isinstance(b, dict) and b.get("type") == "image")
+
+    alts = parsed.get("image_alts", [])
+    if not isinstance(alts, list):
+        alts = []
+    alts = [str(a) if a is not None else "" for a in alts]
+    if len(alts) < n_imgs:
+        alts = alts + [""] * (n_imgs - len(alts))
+    else:
+        alts = alts[:n_imgs]
 
     # Map image blocks from source article blocks list preserving technical URLs
-    blocks = article.get("blocks", [])
     images: List[Dict[str, Any]] = []
+    img_counter = 0
 
     if isinstance(blocks, list):
         for idx, block in enumerate(blocks):
             if isinstance(block, dict) and block.get("type") == "image":
                 img_url = block.get("url", "")
-                alt_fa = out_alts[idx] if idx < len(out_alts) and isinstance(out_alts[idx], str) else ""
+                alt_fa = alts[img_counter] if img_counter < len(alts) else ""
+                img_counter += 1
                 images.append({
                     "index": idx,
                     "url": img_url,

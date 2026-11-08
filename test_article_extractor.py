@@ -299,6 +299,144 @@ class TestArticleExtractor(unittest.TestCase):
         self.assertEqual(results[0]["title"], "Article One")
         self.assertEqual(results[1]["title"], "Article Three")
 
+    # --- New Tests for Image Extraction Quality, Limits, and Fallbacks ---
+    def test_images_confined_to_article_container(self):
+        html = """
+        <html>
+        <body>
+            <div id="sidebar">
+                <img src="https://example.com/sidebar1.jpg" alt="Sidebar 1" />
+                <img src="https://example.com/sidebar2.jpg" alt="Sidebar 2" />
+                <img src="https://example.com/sidebar3.jpg" alt="Sidebar 3" />
+            </div>
+            <article id="article-body">
+                <p>This is paragraph 1 of the article which contains enough text to satisfy the minimum length threshold.</p>
+                <img src="https://example.com/article_image_1.jpg" alt="Article 1" />
+                <p>This is paragraph 2 of the article which contains even more text to ensure the threshold is well exceeded.</p>
+                <img src="https://example.com/article_image_2.jpg" alt="Article 2" />
+            </article>
+        </body>
+        </html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 2)
+        urls = [b["url"] for b in img_blocks]
+        self.assertEqual(urls, ["https://example.com/article_image_1.jpg", "https://example.com/article_image_2.jpg"])
+
+    def test_images_skip_data_urls(self):
+        html = """
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems, ensuring sufficient text is provided.</p>
+            <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA" alt="Data URL" />
+            <img src="https://example.com/valid_image_url_1.jpg" alt="Valid Image" />
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/valid_image_url_1.jpg")
+
+    def test_images_skip_svg(self):
+        html = """
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems, ensuring sufficient text is provided.</p>
+            <img src="https://example.com/graphic_icon.svg" alt="SVG graphic" />
+            <img src="https://example.com/graphic_icon.svg?w=100" alt="SVG with query" />
+            <img src="https://example.com/valid_image_url_2.jpg" alt="Valid Image" />
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/valid_image_url_2.jpg")
+
+    def test_images_skip_navigation_noise(self):
+        html = """
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems, ensuring sufficient text is provided.</p>
+            <img src="https://example.com/site_logo_header.png" alt="logo" width="48" height="48" />
+            <img src="https://example.com/tiny_icon_button.png" alt="icon" width="16" height="16" />
+            <img src="https://example.com/avatar_image_user.jpg" alt="avatar" />
+            <img src="https://example.com/valid_hero_image_for_news.jpg" alt="Valid Hero" width="800" height="600" />
+            <img src="https://example.com/image_without_alt_text.jpg" width="400" height="300" />
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 2)
+        urls = [b["url"] for b in img_blocks]
+        self.assertIn("https://example.com/valid_hero_image_for_news.jpg", urls)
+        self.assertIn("https://example.com/image_without_alt_text.jpg", urls)
+
+    def test_images_dedupe_by_url(self):
+        html = """
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems.</p>
+            <img src="https://example.com/duplicated_image.jpg" alt="First instance" />
+            <p>Some more intermediate paragraph text in the article content to keep the text well formatted and long.</p>
+            <img src="https://example.com/duplicated_image.jpg" alt="Second instance" />
+        </article>
+        """
+        data = extract_article_data(html)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["alt"], "First instance")
+
+    def test_images_capped_at_max(self):
+        imgs = "\n".join(f'<img src="https://example.com/image_{i:03d}_test.jpg" alt="Img {i}" />' for i in range(30))
+        html = f"""
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems, ensuring sufficient text is provided.</p>
+            {imgs}
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 20)
+
+    def test_empty_images_falls_back_to_og_image(self):
+        html = """
+        <html>
+        <head>
+            <meta property="og:image" content="https://example.com/og_hero_image.jpg" />
+        </head>
+        <body>
+            <article id="article-body">
+                <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems and contains no images.</p>
+            </article>
+        </body>
+        </html>
+        """
+        data = extract_article_data(html)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/og_hero_image.jpg")
+        self.assertEqual(img_blocks[0]["alt"], "")
+        self.assertEqual(img_blocks[0]["caption"], "")
+
+    def test_no_images_and_no_og_image_returns_empty(self):
+        html = """
+        <html>
+        <head>
+            <title>Title</title>
+        </head>
+        <body>
+            <article id="article-body">
+                <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems and contains no images at all.</p>
+            </article>
+        </body>
+        </html>
+        """
+        data = extract_article_data(html)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(img_blocks, [])
+
 
 if __name__ == "__main__":
     unittest.main()

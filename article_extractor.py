@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_USER_AGENT = "AutoNews/1.0"
 MIN_CONTENT_LENGTH = 100
+MAX_IMAGES_PER_ARTICLE = 20
 
 # Patterns for elements/classes/ids to decompose (e.g., ads, comments, social shares, widgets)
 UNWANTED_CLASSES_IDS = re.compile(
@@ -195,15 +196,32 @@ def _resolve_image_url(img_tag: Tag) -> Optional[str]:
     return None
 
 
+IMAGE_NOISE_SUBSTRINGS = (
+    "sprite", "icon", "logo", "avatar", "gravatar",
+    "1x1", "pixel.gif", "spacer", "tracking"
+)
+
+IMAGE_NOISE_ALTS = {"", "image", "photo", "picture", "thumbnail", "icon", "logo"}
+
+
 def _is_valid_image(img_tag: Tag, url: Optional[str]) -> bool:
     """Validate whether an image is a genuine article image rather than logo/icon/ad."""
     if not url or not isinstance(url, str):
         return False
 
-    if url.startswith("data:image/"):
+    url_str = url.strip()
+    if url_str.startswith("data:"):
         return False
 
-    if UNWANTED_IMAGE_PATTERNS.search(url):
+    if len(url_str) < 20:
+        return False
+
+    clean_path = url_str.split("?")[0].split("#")[0].lower()
+    if clean_path.endswith(".svg"):
+        return False
+
+    url_lower = url_str.lower()
+    if any(sub in url_lower for sub in IMAGE_NOISE_SUBSTRINGS):
         return False
 
     if img_tag.attrs is not None:
@@ -213,12 +231,38 @@ def _is_valid_image(img_tag: Tag, url: Optional[str]) -> bool:
         if UNWANTED_IMAGE_PATTERNS.search(class_str) or UNWANTED_IMAGE_PATTERNS.search(tag_id):
             return False
 
-        width = img_tag.get("width")
-        height = img_tag.get("height")
-        if width and str(width).strip() in ("1", "0"):
+        raw_alt = img_tag.get("alt")
+        alt_text = _clean_text(raw_alt) or ""
+        alt_lower = alt_text.lower()
+
+        # Check dimensions
+        width_val = None
+        height_val = None
+        if "width" in img_tag.attrs:
+            try:
+                width_val = float(re.sub(r"[^\d.]", "", str(img_tag.get("width"))))
+            except (ValueError, TypeError):
+                pass
+        if "height" in img_tag.attrs:
+            try:
+                height_val = float(re.sub(r"[^\d.]", "", str(img_tag.get("height"))))
+            except (ValueError, TypeError):
+                pass
+
+        if width_val is not None and width_val <= 1:
             return False
-        if height and str(height).strip() in ("1", "0"):
+        if height_val is not None and height_val <= 1:
             return False
+
+        # Skip images where alt matches known noise values AND width/height attributes (if present) are <= 64 pixels.
+        if alt_lower in IMAGE_NOISE_ALTS:
+            is_small = False
+            if width_val is not None and width_val <= 64:
+                is_small = True
+            if height_val is not None and height_val <= 64:
+                is_small = True
+            if is_small:
+                return False
 
     return True
 
@@ -373,6 +417,7 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
     processed_elements = set()
     seen_media_urls = set()
+    image_count = 0
 
     elements = container.find_all(BLOCK_TAGS)
 
@@ -385,6 +430,10 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
 
         ancestors = list(element.parents)
         if any(anc in processed_elements for anc in ancestors):
+            continue
+
+        # Confine check: Ensure element is container or descendant of container
+        if element != container and container not in ancestors:
             continue
 
         tag_name = element.name
@@ -401,10 +450,12 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
         elif tag_name == "figure":
             img = element.find("img")
             if img and isinstance(img, Tag) and img.attrs is not None:
-                img_block = _extract_image_block(img, parent_figure=element)
-                if img_block and img_block["url"] not in seen_media_urls:
-                    seen_media_urls.add(img_block["url"])
-                    blocks.append(img_block)
+                if image_count < MAX_IMAGES_PER_ARTICLE:
+                    img_block = _extract_image_block(img, parent_figure=element)
+                    if img_block and img_block["url"] not in seen_media_urls:
+                        seen_media_urls.add(img_block["url"])
+                        blocks.append(img_block)
+                        image_count += 1
                 processed_elements.add(img)
             else:
                 video = element.find(["video", "iframe"])
@@ -421,12 +472,15 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
 
         # 3. Standalone Image
         elif tag_name == "img":
-            parent_figure = element.find_parent("figure")
-            img_block = _extract_image_block(element, parent_figure=parent_figure)
-            if img_block and img_block["url"] not in seen_media_urls:
-                seen_media_urls.add(img_block["url"])
-                blocks.append(img_block)
+            if image_count < MAX_IMAGES_PER_ARTICLE:
+                parent_figure = element.find_parent("figure")
+                img_block = _extract_image_block(element, parent_figure=parent_figure)
+                if img_block and img_block["url"] not in seen_media_urls:
+                    seen_media_urls.add(img_block["url"])
+                    blocks.append(img_block)
+                    image_count += 1
             processed_elements.add(element)
+            parent_figure = element.find_parent("figure")
             if parent_figure:
                 processed_elements.add(parent_figure)
                 for child in parent_figure.find_all(True):
@@ -454,11 +508,13 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
 
             for img in nested_imgs:
                 if isinstance(img, Tag) and img.attrs is not None and img not in processed_elements:
-                    parent_fig = img.find_parent("figure")
-                    img_block = _extract_image_block(img, parent_figure=parent_fig)
-                    if img_block and img_block["url"] not in seen_media_urls:
-                        seen_media_urls.add(img_block["url"])
-                        blocks.append(img_block)
+                    if image_count < MAX_IMAGES_PER_ARTICLE:
+                        parent_fig = img.find_parent("figure")
+                        img_block = _extract_image_block(img, parent_figure=parent_fig)
+                        if img_block and img_block["url"] not in seen_media_urls:
+                            seen_media_urls.add(img_block["url"])
+                            blocks.append(img_block)
+                            image_count += 1
                     processed_elements.add(img)
 
             for vid in nested_videos:
@@ -511,6 +567,22 @@ def extract_article_data(html_content: str, fallback_summary: Optional[str] = No
     _clean_container(container)
 
     blocks = _extract_blocks(container)
+
+    # Feature-image fallback if no image blocks were extracted
+    has_image = any(b.get("type") == "image" for b in blocks)
+    if not has_image:
+        og_img = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+        if og_img and isinstance(og_img, Tag):
+            content = og_img.get("content")
+            if content and isinstance(content, str) and content.strip():
+                url_str = content.strip()
+                if not url_str.startswith("data:") and not url_str.lower().endswith(".svg") and len(url_str) >= 20:
+                    blocks.append({
+                        "type": "image",
+                        "url": url_str,
+                        "alt": "",
+                        "caption": "",
+                    })
 
     text_parts = [
         block["content"]
