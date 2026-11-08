@@ -290,11 +290,11 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         mock_run_once.assert_not_called()
 
-    # --- New persistence retry tests ---
+    # --- Persistence tests (failed articles abandoned, not retried) ---
     @patch("scheduler.pipeline.run_sources")
     @patch("scheduler.research.research_article")
     @patch("scheduler.publisher.publish_article")
-    def test_run_once_retries_failed_research(self, mock_publish, mock_research, mock_run_sources):
+    def test_run_once_does_not_retry_failed_research(self, mock_publish, mock_research, mock_run_sources):
         mock_run_sources.return_value = []
         norm_url = normalize_url("https://example.com/retry-res")
         art_data = {"title": "Pre-seeded", "url": "https://example.com/retry-res"}
@@ -303,19 +303,16 @@ class TestScheduler(unittest.TestCase):
         save_article_data(norm_url, art_data, db_path=self.temp_db_path)
         mark_research_status(norm_url, "failed", error_message="Previous error", db_path=self.temp_db_path)
 
-        mock_research.return_value = {"title": "Res", "body": "B"}
-        mock_publish.return_value = {"ok": True, "id": "p1", "error": None}
-
         summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
 
-        self.assertEqual(summary["researched"], 1)
-        self.assertEqual(summary["published"], 1)
-        mock_research.assert_called_once_with(art_data, unittest.mock.ANY, target_language="fa")
+        self.assertEqual(summary["researched"], 0)
+        self.assertEqual(summary["published"], 0)
+        mock_research.assert_not_called()
 
     @patch("scheduler.pipeline.run_sources")
     @patch("scheduler.research.research_article")
     @patch("scheduler.publisher.publish_article")
-    def test_run_once_retries_failed_publish(self, mock_publish, mock_research, mock_run_sources):
+    def test_run_once_does_not_retry_failed_publish(self, mock_publish, mock_research, mock_run_sources):
         mock_run_sources.return_value = []
         norm_url = normalize_url("https://example.com/retry-pub")
 
@@ -324,14 +321,12 @@ class TestScheduler(unittest.TestCase):
         save_research_data(norm_url, {"title": "Res", "body": "B"}, db_path=self.temp_db_path)
         mark_publish_status(norm_url, "failed", error_message="Previous pub error", db_path=self.temp_db_path)
 
-        mock_publish.return_value = {"ok": True, "id": "p2", "error": None}
-
         summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
 
         self.assertEqual(summary["researched"], 0)
-        self.assertEqual(summary["published"], 1)
+        self.assertEqual(summary["published"], 0)
         mock_research.assert_not_called()
-        mock_publish.assert_called_once_with({"title": "Res", "body": "B"}, unittest.mock.ANY)
+        mock_publish.assert_not_called()
 
     @patch("scheduler.pipeline.run_sources")
     @patch("scheduler.research.research_article")
@@ -356,11 +351,10 @@ class TestScheduler(unittest.TestCase):
     @patch("scheduler.research.research_article")
     @patch("scheduler.publisher.publish_article")
     def test_run_once_limit_only_affects_new_extractions(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
-        norm_url_retry = normalize_url("https://example.com/retry-res-item")
-        art_retry = {"title": "Retry", "url": "https://example.com/retry-res-item"}
-        record_article("https://example.com/retry-res-item", norm_url_retry, status="completed", db_path=self.temp_db_path)
-        save_article_data(norm_url_retry, art_retry, db_path=self.temp_db_path)
-        mark_research_status(norm_url_retry, "failed", db_path=self.temp_db_path)
+        norm_url_pending = normalize_url("https://example.com/pending-res-item")
+        art_pending = {"title": "Pending", "url": "https://example.com/pending-res-item"}
+        record_article("https://example.com/pending-res-item", norm_url_pending, status="completed", db_path=self.temp_db_path)
+        save_article_data(norm_url_pending, art_pending, db_path=self.temp_db_path)
 
         mock_run_sources.return_value = [
             {"title": f"New {i}", "url": f"https://example.com/new-{i}"} for i in range(3)
@@ -371,7 +365,7 @@ class TestScheduler(unittest.TestCase):
         summary = run_once([{"name": "S"}], NullProvider(), NullPublisher(), limit=1, db_path=self.temp_db_path)
 
         self.assertEqual(summary["extracted"], 3)
-        self.assertEqual(summary["researched"], 2)  # 1 retry + 1 new
+        self.assertEqual(summary["researched"], 2)  # 1 pending from db + 1 new (limited to 1)
         self.assertEqual(summary["published"], 2)
 
     @patch("scheduler.pipeline.run_sources")
@@ -534,6 +528,69 @@ class TestScheduler(unittest.TestCase):
     def test_main_accepts_daily_limit_flag(self):
         args = parse_args(["--daily-limit", "5"])
         self.assertEqual(args.daily_limit, 5)
+
+    # --- New Tests for Attempt-Based Daily Limits & Abandoning Failures ---
+    @patch("scheduler.time.sleep")
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_respects_daily_limit_on_attempts(self, mock_publish, mock_research, mock_run_sources, mock_sleep):
+        # Pre-seed DB with 2 articles attempted today (one completed, one failed)
+        record_article("https://x/1", "https://x/1", status="completed", db_path=self.temp_db_path)
+        mark_research_status("https://x/1", "completed", db_path=self.temp_db_path)
+
+        record_article("https://x/2", "https://x/2", status="completed", db_path=self.temp_db_path)
+        mark_research_status("https://x/2", "failed", db_path=self.temp_db_path)
+
+        # Pre-seed 5 pending articles
+        for i in range(3, 8):
+            url = f"https://x/{i}"
+            record_article(url, url, status="completed", db_path=self.temp_db_path)
+            save_article_data(url, {"title": f"T{i}", "url": url}, db_path=self.temp_db_path)
+
+        mock_run_sources.return_value = []
+        mock_research.return_value = {"title": "R", "body": "B"}
+        mock_publish.return_value = {"ok": True, "id": "p"}
+
+        # daily_limit = 3; already attempted = 2; remaining = 1
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path, daily_limit=3)
+
+        self.assertEqual(summary["researched"], 1)
+        self.assertEqual(mock_research.call_count, 1)
+
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_failed_articles_not_retried_next_run(self, mock_publish, mock_research, mock_run_sources):
+        for i in range(3):
+            url = f"https://x/failed-{i}"
+            record_article(url, url, status="completed", db_path=self.temp_db_path)
+            save_article_data(url, {"title": f"F{i}", "url": url}, db_path=self.temp_db_path)
+            mark_research_status(url, "failed", db_path=self.temp_db_path)
+
+        mock_run_sources.return_value = []
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
+
+        self.assertEqual(summary["researched"], 0)
+        mock_research.assert_not_called()
+
+    @patch("scheduler.pipeline.run_sources")
+    @patch("scheduler.research.research_article")
+    @patch("scheduler.publisher.publish_article")
+    def test_run_once_failed_publish_not_retried_next_run(self, mock_publish, mock_research, mock_run_sources):
+        url = "https://x/failed-pub"
+        record_article(url, url, status="completed", db_path=self.temp_db_path)
+        mark_research_status(url, "completed", db_path=self.temp_db_path)
+        save_research_data(url, {"title": "R", "body": "B"}, db_path=self.temp_db_path)
+        mark_publish_status(url, "failed", db_path=self.temp_db_path)
+
+        mock_run_sources.return_value = []
+
+        summary = run_once([], NullProvider(), NullPublisher(), db_path=self.temp_db_path)
+
+        self.assertEqual(summary["published"], 0)
+        mock_publish.assert_not_called()
 
 
 if __name__ == "__main__":
