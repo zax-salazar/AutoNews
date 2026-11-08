@@ -441,7 +441,39 @@ class TestResearch(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
         mock_sleep.assert_not_called()
 
-    # --- Bug E: Image Prompt and Alignment Tests ---
+    # --- Prompt Directive, Formatting, and Alignment Tests ---
+    def test_prompt_forbids_translation(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertIn("do not translate", prompt.lower())
+
+    def test_prompt_asks_for_original_prose(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertIn("original", prompt.lower())
+
+    def test_prompt_forbids_source_mention(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertIn("do not mention the source publisher", prompt.lower())
+
+    def test_prompt_includes_length_ranges(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertTrue("2200-3000" in prompt or "2200–3000" in prompt)
+        self.assertTrue("800-1300" in prompt or "800–1300" in prompt)
+
+    def test_prompt_includes_structure_rules(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertIn("##", prompt)
+        self.assertIn("subheading", prompt.lower())
+
+    def test_prompt_requires_english_proper_nouns(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertTrue("stay in English" in prompt or "all proper nouns" in prompt.lower())
+
     def test_prompt_lists_images_with_indices(self):
         article = {
             "title": "Title",
@@ -455,7 +487,6 @@ class TestResearch(unittest.TestCase):
             ],
         }
         prompt = build_research_prompt(article)
-        self.assertIn("IMAGES IN THE SOURCE", prompt)
         self.assertIn("[0] url=https://example.com/img1.jpg alt=Alt 1 caption=Cap 1", prompt)
         self.assertIn("[1] url=https://example.com/img2.jpg alt=Alt 2 caption=Cap 2", prompt)
 
@@ -468,12 +499,30 @@ class TestResearch(unittest.TestCase):
             ],
         }
         prompt = build_research_prompt(article)
-        self.assertNotIn("IMAGES IN THE SOURCE", prompt)
+        self.assertIn("(no images)", prompt)
 
-    def test_prompt_requires_image_alts_length(self):
-        article = {"title": "Title", "url": "https://example.com/test"}
+    def test_prompt_includes_source_title(self):
+        article = {"title": "Unique Source Title 777", "url": "https://example.com/test"}
         prompt = build_research_prompt(article)
-        self.assertIn("length exactly equals", prompt)
+        self.assertIn("Unique Source Title 777", prompt)
+
+    def test_prompt_truncates_very_long_content(self):
+        article = {
+            "title": "Title",
+            "url": "https://example.com/test",
+            "content": "A" * 20000,
+        }
+        prompt = build_research_prompt(article)
+        self.assertLess(len(prompt), 12000)
+        self.assertIn("[... content truncated", prompt)
+
+    def test_prompt_target_language_label(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt_fa = build_research_prompt(article, target_language="fa")
+        self.assertIn("Persian (Farsi)", prompt_fa)
+
+        prompt_en = build_research_prompt(article, target_language="en")
+        self.assertIn("English", prompt_en)
 
     def test_image_alts_normalized_to_short_list(self):
         article = {
