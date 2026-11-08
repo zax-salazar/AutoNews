@@ -19,6 +19,7 @@ from database import (
     get_pending_research,
     get_pending_publish,
     count_researched_today,
+    count_research_attempts_today,
 )
 
 
@@ -304,8 +305,7 @@ class TestDatabase(unittest.TestCase):
         mark_research_status(norm, "failed", db_path=self.temp_db_path)
 
         pending = get_pending_research(self.temp_db_path)
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["normalized_url"], norm)
+        self.assertEqual(pending, [])
 
     def test_get_pending_research_excludes_completed(self):
         init_db(self.temp_db_path)
@@ -344,7 +344,9 @@ class TestDatabase(unittest.TestCase):
         save_research_data(norm2, {"body": "b2"}, self.temp_db_path)
 
         pending = get_pending_publish(self.temp_db_path)
-        self.assertEqual(len(pending), 2)
+        # Failed publish is excluded from pending publish
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["normalized_url"], norm1)
 
     def test_new_columns_nullable_by_default(self):
         init_db(self.temp_db_path)
@@ -408,6 +410,7 @@ class TestDatabase(unittest.TestCase):
         self.assertIsNotNone(row2["researched_at"])
 
     def test_mark_research_failed_does_not_set_researched_at(self):
+        # Legacy test updated to assert researched_at is set even on failed
         init_db(self.temp_db_path)
         norm = "https://example.com/res-failed-at-test"
         record_article(norm, norm, status="completed", db_path=self.temp_db_path)
@@ -417,11 +420,11 @@ class TestDatabase(unittest.TestCase):
         conn = get_connection(self.temp_db_path)
         row = conn.execute("SELECT researched_at FROM articles WHERE normalized_url = ?", (norm,)).fetchone()
         conn.close()
-        self.assertIsNone(row["researched_at"])
+        self.assertIsNotNone(row["researched_at"])
 
     def test_count_researched_today_empty(self):
         init_db(self.temp_db_path)
-        self.assertEqual(count_researched_today(self.temp_db_path), 0)
+        self.assertEqual(count_research_attempts_today(self.temp_db_path), 0)
 
     def test_count_researched_today_counts_only_completed_today(self):
         init_db(self.temp_db_path)
@@ -450,10 +453,11 @@ class TestDatabase(unittest.TestCase):
         record_article(norm_failed, norm_failed, status="completed", db_path=self.temp_db_path)
         mark_research_status(norm_failed, "failed", db_path=self.temp_db_path)
 
-        self.assertEqual(count_researched_today(self.temp_db_path), 2)
+        # 2 completed today + 1 failed today = 3 attempts today
+        self.assertEqual(count_research_attempts_today(self.temp_db_path), 3)
 
     def test_count_researched_today_none_db_path(self):
-        self.assertEqual(count_researched_today(None), 0)
+        self.assertEqual(count_research_attempts_today(None), 0)
 
     def test_count_researched_today_missing_table(self):
         # Empty DB file without articles table
@@ -463,7 +467,81 @@ class TestDatabase(unittest.TestCase):
         conn.close()
 
         # Must log warning and return 0, not raise
-        self.assertEqual(count_researched_today(self.temp_db_path), 0)
+        self.assertEqual(count_research_attempts_today(self.temp_db_path), 0)
+
+    # --- New Tests for Attempt Semantics and Retry Abandonment ---
+    def test_get_pending_research_excludes_failed(self):
+        init_db(self.temp_db_path)
+        p_url = "https://example.com/pending"
+        f_url = "https://example.com/failed"
+
+        record_article(p_url, p_url, status="completed", db_path=self.temp_db_path)
+        # research_status is 'pending' by default
+
+        record_article(f_url, f_url, status="completed", db_path=self.temp_db_path)
+        mark_research_status(f_url, "failed", db_path=self.temp_db_path)
+
+        pending = get_pending_research(self.temp_db_path)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["normalized_url"], p_url)
+
+    def test_get_pending_publish_excludes_failed(self):
+        init_db(self.temp_db_path)
+        p_url = "https://example.com/pub-pending"
+        f_url = "https://example.com/pub-failed"
+
+        record_article(p_url, p_url, status="completed", db_path=self.temp_db_path)
+        mark_research_status(p_url, "completed", db_path=self.temp_db_path)
+
+        record_article(f_url, f_url, status="completed", db_path=self.temp_db_path)
+        mark_research_status(f_url, "completed", db_path=self.temp_db_path)
+        mark_publish_status(f_url, "failed", db_path=self.temp_db_path)
+
+        pending = get_pending_publish(self.temp_db_path)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["normalized_url"], p_url)
+
+    def test_mark_research_failed_sets_researched_at(self):
+        init_db(self.temp_db_path)
+        norm = "https://example.com/res-failed-sets-timestamp"
+        record_article(norm, norm, status="completed", db_path=self.temp_db_path)
+
+        conn = get_connection(self.temp_db_path)
+        row = conn.execute("SELECT researched_at FROM articles WHERE normalized_url = ?", (norm,)).fetchone()
+        conn.close()
+        self.assertIsNone(row["researched_at"])
+
+        mark_research_status(norm, "failed", db_path=self.temp_db_path)
+
+        conn2 = get_connection(self.temp_db_path)
+        row2 = conn2.execute("SELECT researched_at FROM articles WHERE normalized_url = ?", (norm,)).fetchone()
+        conn2.close()
+        self.assertIsNotNone(row2["researched_at"])
+
+    def test_count_research_attempts_today_counts_both(self):
+        init_db(self.temp_db_path)
+        c_today = "https://example.com/c-today"
+        f_today = "https://example.com/f-today"
+        c_yesterday = "https://example.com/c-yesterday"
+
+        record_article(c_today, c_today, status="completed", db_path=self.temp_db_path)
+        mark_research_status(c_today, "completed", db_path=self.temp_db_path)
+
+        record_article(f_today, f_today, status="completed", db_path=self.temp_db_path)
+        mark_research_status(f_today, "failed", db_path=self.temp_db_path)
+
+        record_article(c_yesterday, c_yesterday, status="completed", db_path=self.temp_db_path)
+        mark_research_status(c_yesterday, "completed", db_path=self.temp_db_path)
+        conn = get_connection(self.temp_db_path)
+        conn.execute(
+            "UPDATE articles SET researched_at = datetime('now', '-1 day') WHERE normalized_url = ?",
+            (c_yesterday,),
+        )
+        conn.commit()
+        conn.close()
+
+        count = count_research_attempts_today(self.temp_db_path)
+        self.assertEqual(count, 2)
 
 
 if __name__ == "__main__":

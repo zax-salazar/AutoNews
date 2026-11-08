@@ -422,30 +422,20 @@ def mark_research_status(
     try:
         with db_connection(db_path) as conn:
             cursor = conn.cursor()
-            if status == "completed":
-                cursor.execute(
-                    """
-                    UPDATE articles
-                    SET research_status = ?, error_message = ?, researched_at = CURRENT_TIMESTAMP, last_seen = CURRENT_TIMESTAMP
-                    WHERE normalized_url = ?;
-                    """,
-                    (status, error_message, normalized_url),
-                )
-            else:
-                cursor.execute(
-                    """
-                    UPDATE articles
-                    SET research_status = ?, error_message = ?, last_seen = CURRENT_TIMESTAMP
-                    WHERE normalized_url = ?;
-                    """,
-                    (status, error_message, normalized_url),
-                )
+            cursor.execute(
+                """
+                UPDATE articles
+                SET research_status = ?, error_message = ?, researched_at = CURRENT_TIMESTAMP, last_seen = CURRENT_TIMESTAMP
+                WHERE normalized_url = ?;
+                """,
+                (status, error_message, normalized_url),
+            )
     except Exception as exc:
         logger.error("Failed to mark research_status for %s: %s", normalized_url, exc)
 
 
-def count_researched_today(db_path: str = DEFAULT_DB_PATH) -> int:
-    """Number of articles whose research completed today (UTC).
+def count_research_attempts_today(db_path: str = DEFAULT_DB_PATH) -> int:
+    """Number of article research attempts today (UTC).
     Returns 0 on db_path falsy, missing table, or any SQL error
     (log via logger.warning but do not raise).
     """
@@ -458,16 +448,19 @@ def count_researched_today(db_path: str = DEFAULT_DB_PATH) -> int:
             cursor.execute(
                 """
                 SELECT COUNT(*) FROM articles
-                WHERE research_status = 'completed'
-                  AND researched_at IS NOT NULL
+                WHERE researched_at IS NOT NULL
                   AND date(researched_at) = date('now');
                 """
             )
             row = cursor.fetchone()
             return row[0] if row else 0
     except Exception as exc:
-        logger.warning("Failed to count researched today for DB %s: %s", db_path, exc)
+        logger.warning("Failed to count research attempts today for DB %s: %s", db_path, exc)
         return 0
+
+
+# Backward-compatible alias
+count_researched_today = count_research_attempts_today
 
 
 def mark_publish_status(
@@ -499,7 +492,7 @@ def mark_publish_status(
 
 
 def get_pending_research(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
-    """Return articles that need research (research_status IN ('pending', 'failed')), where extraction is completed."""
+    """Return articles that need research (research_status = 'pending'), where extraction is completed."""
     if not db_path:
         return []
 
@@ -511,7 +504,7 @@ def get_pending_research(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]
                 """
                 SELECT url, normalized_url, title, article_data
                 FROM articles
-                WHERE status = 'completed' AND research_status IN ('pending', 'failed');
+                WHERE status = 'completed' AND research_status = 'pending';
                 """
             )
             rows = cursor.fetchall()
@@ -535,7 +528,7 @@ def get_pending_research(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]
 
 
 def get_pending_publish(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
-    """Return articles that need publish (publish_status IN ('pending', 'failed')), where research_status = 'completed'."""
+    """Return articles that need publish (publish_status = 'pending'), where research_status = 'completed'."""
     if not db_path:
         return []
 
@@ -547,7 +540,7 @@ def get_pending_publish(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
                 """
                 SELECT url, normalized_url, title, research_data
                 FROM articles
-                WHERE research_status = 'completed' AND publish_status IN ('pending', 'failed');
+                WHERE research_status = 'completed' AND publish_status = 'pending';
                 """
             )
             rows = cursor.fetchall()

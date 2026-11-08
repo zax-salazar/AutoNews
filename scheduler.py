@@ -60,6 +60,8 @@ def run_once(
         db_path (str, optional): SQLite DB path. None disables DB persistence.
         target_language (str): Target output language code ('fa').
         limit (int, optional): Optional limit on number of newly extracted articles to process.
+        daily_limit (int, optional): Optional cap on research attempts (successes + failures)
+            per calendar day (UTC). Failed articles are abandoned and not retried on later runs.
 
     Returns:
         dict: Summary result dictionary.
@@ -118,12 +120,12 @@ def run_once(
     # Research stage loop with daily cap and pacing delay
     if db_path:
         effective = daily_limit if daily_limit is not None else _daily_limit()
-        already = database.count_researched_today(db_path)
+        already = database.count_research_attempts_today(db_path)
         remaining = None if effective <= 0 else max(0, effective - already)
 
         if remaining == 0:
             logger.warning(
-                "Daily research limit reached (%d/%d) — skipping research",
+                "Daily research attempt limit reached (%d/%d) — skipping research",
                 already, effective,
             )
             to_research = []
