@@ -625,6 +625,22 @@ class TestResearch(unittest.TestCase):
         for fk in forbidden_keys:
             self.assertNotIn(fk, result)
 
+    # --- Bug 2: Proper Noun Anti-Hallucination Tests ---
+    def test_prompt_forbids_invented_proper_nouns(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertTrue("invent" in prompt.lower() or "do not invent" in prompt.lower())
+
+    def test_prompt_requires_source_grounding_for_names(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertIn("does not appear in the source article", prompt.lower())
+
+    def test_prompt_permits_industry_facts(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertIn("genuinely established industry facts", prompt.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

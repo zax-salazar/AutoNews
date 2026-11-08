@@ -2,6 +2,7 @@ import html
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
 from bs4 import BeautifulSoup, Tag, Comment
 import requests
 
@@ -159,41 +160,138 @@ def _extract_description(
     return None
 
 
+def _parse_srcset(srcset_val: str) -> List[Tuple[float, str]]:
+    """Parse srcset string into a list of (score, url) tuples sorted by score ascending."""
+    if not srcset_val or not isinstance(srcset_val, str):
+        return []
+
+    entries: List[Tuple[float, str]] = []
+    # Split on commas that separate candidate entries
+    raw_candidates = [c.strip() for c in srcset_val.split(",") if c.strip()]
+    for candidate in raw_candidates:
+        tokens = candidate.split()
+        if not tokens:
+            continue
+        c_url = tokens[0].strip()
+        if c_url.startswith("data:"):
+            continue
+
+        score = 0.0
+        if len(tokens) > 1:
+            desc = tokens[1].strip().lower()
+            if desc.endswith("w"):
+                try:
+                    score = float(desc[:-1])
+                except ValueError:
+                    score = 0.0
+            elif desc.endswith("x"):
+                try:
+                    score = float(desc[:-1]) * 1000.0
+                except ValueError:
+                    score = 0.0
+
+        entries.append((score, c_url))
+
+    return entries
+
+
 def _resolve_image_url(img_tag: Tag) -> Optional[str]:
-    """Extract best image URL from <img> attributes or parent/sibling <source> tags."""
+    """Extract best image URL for an <img> element picking a single final URL:
+    Priority:
+      1. largest srcset entry (from img srcset/data-srcset or parent <picture> <source>)
+      2. parent <picture> <source> src/data-src
+      3. img src/data-src/data-lazy-src/data-original
+    """
     if img_tag.attrs is None:
         return None
 
-    # 1. Check direct img attributes (data-src, data-lazy-src, data-original, src)
-    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
-        val = img_tag.get(attr)
-        if val and isinstance(val, str) and not val.startswith("data:image/"):
-            return val.strip()
+    parent = img_tag.parent
+    picture_sources = parent.find_all("source") if (parent and isinstance(parent, Tag) and parent.name == "picture") else []
 
-    # 2. Check direct img srcset attributes (srcset, data-srcset)
+    # 1. Collect srcset candidates from parent <picture> <source> tags
+    picture_srcset_candidates: List[Tuple[float, str]] = []
+    for source in picture_sources:
+        if isinstance(source, Tag) and source.attrs:
+            for attr in ("srcset", "data-srcset"):
+                val = source.get(attr)
+                if val and isinstance(val, str):
+                    picture_srcset_candidates.extend(_parse_srcset(val))
+
+    # 2. Collect direct img srcset candidates
+    img_srcset_candidates: List[Tuple[float, str]] = []
     for srcset_attr in ("srcset", "data-srcset"):
         srcset = img_tag.get(srcset_attr)
         if srcset and isinstance(srcset, str):
-            candidates = [c.strip().split()[0] for c in srcset.split(",") if c.strip()]
-            valid_candidates = [c for c in candidates if not c.startswith("data:image/")]
-            if valid_candidates:
-                return valid_candidates[-1]
+            img_srcset_candidates.extend(_parse_srcset(srcset))
 
-    # 3. Check parent <picture> or sibling <source> tags
-    parent = img_tag.parent
-    if parent and isinstance(parent, Tag):
-        sources = parent.find_all("source") if parent.name == "picture" else []
-        for source in sources:
-            if isinstance(source, Tag) and source.attrs:
-                for attr in ("srcset", "data-srcset", "src", "data-src"):
-                    val = source.get(attr)
-                    if val and isinstance(val, str):
-                        candidates = [c.strip().split()[0] for c in val.split(",") if c.strip()]
-                        valid_candidates = [c for c in candidates if not c.startswith("data:image/")]
-                        if valid_candidates:
-                            return valid_candidates[-1]
+    # Check srcset candidates: largest by descriptor
+    if picture_srcset_candidates:
+        picture_srcset_candidates.sort(key=lambda x: x[0])
+        return picture_srcset_candidates[-1][1]
+
+    if img_srcset_candidates:
+        img_srcset_candidates.sort(key=lambda x: x[0])
+        return img_srcset_candidates[-1][1]
+
+    # 3. Check parent <picture> <source> src / data-src
+    for source in picture_sources:
+        if isinstance(source, Tag) and source.attrs:
+            for attr in ("src", "data-src"):
+                val = source.get(attr)
+                if val and isinstance(val, str) and not val.strip().startswith("data:"):
+                    return val.strip()
+
+    # 4. Check direct img attributes
+    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+        val = img_tag.get(attr)
+        if val and isinstance(val, str) and not val.strip().startswith("data:"):
+            return val.strip()
 
     return None
+
+
+SIZE_SUFFIX_PATTERN = re.compile(
+    r"-\d{2,5}-\d{1,3}\.(jpg|jpeg|png|webp|gif)$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_image_url(url: str) -> str:
+    """Strip size/quality variants for dedup purposes only.
+    - Remove trailing "-NNN-NN" segments before the file extension
+      (e.g. "-1200-80", "-1920-80", "-2342-80").
+    - Remove query strings of the form ?w=NNN, ?width=NNN, ?q=NN.
+    - Return the normalized URL. The ORIGINAL url is still used
+      for the block; this normalized form is only the dedup key.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+
+    url_str = url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(url_str)
+    except Exception:
+        return url_str.lower()
+
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path
+
+    # Remove trailing suffix matching regex -\d{2,5}-\d{1,3}\.(jpg|jpeg|png|webp|gif)$ from path
+    match = SIZE_SUFFIX_PATTERN.search(path)
+    if match:
+        ext = match.group(1)
+        path = path[:match.start()] + "." + ext
+
+    # Strip query params w, width, q, quality
+    query_params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    filtered_query = [
+        (k, v) for k, v in query_params
+        if k.lower() not in ("w", "width", "q", "quality")
+    ]
+    new_query = urllib.parse.urlencode(filtered_query)
+
+    return urllib.parse.urlunsplit((scheme, netloc, path, new_query, ""))
 
 
 IMAGE_NOISE_SUBSTRINGS = (
@@ -416,7 +514,7 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
     """Extract structured, DOM-ordered blocks (paragraphs, headings, images, videos) from container."""
     blocks: List[Dict[str, Any]] = []
     processed_elements = set()
-    seen_media_urls = set()
+    seen_normalized_media_urls = set()
     image_count = 0
 
     elements = container.find_all(BLOCK_TAGS)
@@ -452,17 +550,19 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
             if img and isinstance(img, Tag) and img.attrs is not None:
                 if image_count < MAX_IMAGES_PER_ARTICLE:
                     img_block = _extract_image_block(img, parent_figure=element)
-                    if img_block and img_block["url"] not in seen_media_urls:
-                        seen_media_urls.add(img_block["url"])
-                        blocks.append(img_block)
-                        image_count += 1
+                    if img_block:
+                        norm_key = _normalize_image_url(img_block["url"])
+                        if norm_key not in seen_normalized_media_urls:
+                            seen_normalized_media_urls.add(norm_key)
+                            blocks.append(img_block)
+                            image_count += 1
                 processed_elements.add(img)
             else:
                 video = element.find(["video", "iframe"])
                 if video and isinstance(video, Tag) and video.attrs is not None:
                     video_block = _extract_video_block(video)
-                    if video_block and video_block["url"] not in seen_media_urls:
-                        seen_media_urls.add(video_block["url"])
+                    if video_block and video_block["url"] not in seen_normalized_media_urls:
+                        seen_normalized_media_urls.add(video_block["url"])
                         blocks.append(video_block)
                     processed_elements.add(video)
 
@@ -475,10 +575,12 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
             if image_count < MAX_IMAGES_PER_ARTICLE:
                 parent_figure = element.find_parent("figure")
                 img_block = _extract_image_block(element, parent_figure=parent_figure)
-                if img_block and img_block["url"] not in seen_media_urls:
-                    seen_media_urls.add(img_block["url"])
-                    blocks.append(img_block)
-                    image_count += 1
+                if img_block:
+                    norm_key = _normalize_image_url(img_block["url"])
+                    if norm_key not in seen_normalized_media_urls:
+                        seen_normalized_media_urls.add(norm_key)
+                        blocks.append(img_block)
+                        image_count += 1
             processed_elements.add(element)
             parent_figure = element.find_parent("figure")
             if parent_figure:
@@ -489,8 +591,8 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
         # 4. Standalone Video or Iframe
         elif tag_name in ("video", "iframe"):
             video_block = _extract_video_block(element)
-            if video_block and video_block["url"] not in seen_media_urls:
-                seen_media_urls.add(video_block["url"])
+            if video_block and video_block["url"] not in seen_normalized_media_urls:
+                seen_normalized_media_urls.add(video_block["url"])
                 blocks.append(video_block)
             processed_elements.add(element)
 
@@ -511,17 +613,19 @@ def _extract_blocks(container: Tag) -> List[Dict[str, Any]]:
                     if image_count < MAX_IMAGES_PER_ARTICLE:
                         parent_fig = img.find_parent("figure")
                         img_block = _extract_image_block(img, parent_figure=parent_fig)
-                        if img_block and img_block["url"] not in seen_media_urls:
-                            seen_media_urls.add(img_block["url"])
-                            blocks.append(img_block)
-                            image_count += 1
+                        if img_block:
+                            norm_key = _normalize_image_url(img_block["url"])
+                            if norm_key not in seen_normalized_media_urls:
+                                seen_normalized_media_urls.add(norm_key)
+                                blocks.append(img_block)
+                                image_count += 1
                     processed_elements.add(img)
 
             for vid in nested_videos:
                 if isinstance(vid, Tag) and vid.attrs is not None and vid not in processed_elements:
                     video_block = _extract_video_block(vid)
-                    if video_block and video_block["url"] not in seen_media_urls:
-                        seen_media_urls.add(video_block["url"])
+                    if video_block and video_block["url"] not in seen_normalized_media_urls:
+                        seen_normalized_media_urls.add(video_block["url"])
                         blocks.append(video_block)
                     processed_elements.add(vid)
 

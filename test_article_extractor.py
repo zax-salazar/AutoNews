@@ -7,6 +7,7 @@ from article_extractor import (
     extract_article_data,
     extract_article,
     extract_articles,
+    _normalize_image_url,
     DEFAULT_USER_AGENT,
     MIN_CONTENT_LENGTH,
 )
@@ -436,6 +437,89 @@ class TestArticleExtractor(unittest.TestCase):
         data = extract_article_data(html)
         img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
         self.assertEqual(img_blocks, [])
+
+    # --- Bug 1: Srcset selection and size/quality variant deduplication tests ---
+    def test_srcset_single_variant_picked(self):
+        html = """
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems, ensuring sufficient text is provided.</p>
+            <img src="https://example.com/a.jpg" srcset="https://example.com/a-1200.jpg 1200w, https://example.com/a-1920.jpg 1920w" alt="Hero" />
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/a-1920.jpg")
+
+    def test_srcset_duplicate_normalized(self):
+        html = """
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems, ensuring sufficient text is provided.</p>
+            <img src="https://example.com/x-1200-80.png" alt="First" />
+            <p>Second paragraph separating elements in the article content to keep the text well formatted and long enough.</p>
+            <img src="https://example.com/x-1280-80.png" alt="Second" />
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/x-1200-80.png")
+
+    def test_picture_source_picked_when_present(self):
+        html = """
+        <article id="article-body">
+            <p>This is an article that is long enough to meet the 100 character threshold for extraction without problems, ensuring sufficient text is provided.</p>
+            <picture>
+                <source srcset="https://example.com/a-1920.webp 1920w" />
+                <img src="https://example.com/a.jpg" alt="Pic" />
+            </picture>
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 1)
+        self.assertEqual(img_blocks[0]["url"], "https://example.com/a-1920.webp")
+
+    def test_normalize_image_url_strips_size_suffix(self):
+        u1 = _normalize_image_url("https://cdn.example.com/ABC-1200-80.png")
+        u2 = _normalize_image_url("https://cdn.example.com/ABC-1280-80.png")
+        self.assertEqual(u1, "https://cdn.example.com/ABC.png")
+        self.assertEqual(u1, u2)
+
+        # Query param stripping
+        u3 = _normalize_image_url("https://cdn.example.com/image.jpg?w=1200&q=80")
+        u4 = _normalize_image_url("https://cdn.example.com/image.jpg?width=1920&quality=90")
+        self.assertEqual(u3, "https://cdn.example.com/image.jpg")
+        self.assertEqual(u3, u4)
+
+    def test_normalize_image_url_keeps_original_when_no_suffix(self):
+        url = "https://cdn.example.com/unique-image-name.jpg"
+        self.assertEqual(_normalize_image_url(url), url)
+
+    def test_chess_style_duplicate_collapsed_to_6(self):
+        # 1 youtube thumb + 6 pairs of srcset variants (same base, different size) = 7 images
+        img_pairs = []
+        for i in range(6):
+            img_pairs.append(
+                f'<img src="https://example.com/chess_move_{i}-1200-80.png" alt="Move {i} 1200" />\n'
+                f'<p>Paragraph text between chess images to maintain formatting and proper DOM structure.</p>\n'
+                f'<img src="https://example.com/chess_move_{i}-1280-80.png" alt="Move {i} 1280" />'
+            )
+        html = f"""
+        <article id="article-body">
+            <p>Introductory paragraph discussing chess strategies and tactics with enough text to exceed minimum length limits.</p>
+            <img src="https://img.youtube.com/vi/abcdef/maxresdefault.jpg" alt="Video thumbnail" />
+            <p>Second paragraph leading into the detailed breakdowns of the moves analyzed in the article.</p>
+            {'\n'.join(img_pairs)}
+        </article>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
+        self.assertEqual(len(img_blocks), 7)
 
 
 if __name__ == "__main__":
