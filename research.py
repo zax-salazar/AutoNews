@@ -240,7 +240,7 @@ def build_research_prompt(
         policy (str): Policy identifier ("B").
 
     Returns:
-        str: Structured directive prompt string.
+        str: Structured directive prompt string with anti-hallucination rules forbidding invented proper nouns.
     """
     if target_language == "fa":
         target_language_label = "Persian (Farsi)"
@@ -411,6 +411,21 @@ ANTI-HALLUCINATION
 - No "منابع می‌گویند" or "گفته می‌شود" hedging unless the source is
   explicitly speculative (rumor type). For rumor-type news, do hedge
   — but clearly.
+- Do NOT invent or guess the NAME of a specific work (documentary,
+  film, book, song, album, TV series, comic, podcast, event) if the
+  name does not appear in the SOURCE ARTICLE above. If the source
+  describes an event but doesn't name it, describe it descriptively
+  in Persian (e.g. 'یک مستند درباره استودیو' — 'a documentary about
+  the studio') instead of inventing a title.
+- The only proper nouns you may include are:
+    (a) proper nouns that appear verbatim in the SOURCE ARTICLE,
+    (b) game / company / engine / platform / person names that are
+        genuinely established industry facts about the entities
+        named in the source (e.g. Valve, Half-Life, Unreal Engine).
+  Anything else is a hallucination and will be rejected.
+- If you are unsure whether a specific name is real, put your
+  uncertainty in `research_notes`, NOT in `title`, `summary`,
+  `body`, or `seo_description`.
 
 ====================================================================
 IMAGE PLACEMENT
