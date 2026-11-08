@@ -441,6 +441,141 @@ class TestResearch(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
         mock_sleep.assert_not_called()
 
+    # --- Bug E: Image Prompt and Alignment Tests ---
+    def test_prompt_lists_images_with_indices(self):
+        article = {
+            "title": "Title",
+            "url": "https://example.com/test",
+            "blocks": [
+                {"type": "paragraph", "content": "Text 1"},
+                {"type": "image", "url": "https://example.com/img1.jpg", "alt": "Alt 1", "caption": "Cap 1"},
+                {"type": "paragraph", "content": "Text 2"},
+                {"type": "paragraph", "content": "Text 3"},
+                {"type": "image", "url": "https://example.com/img2.jpg", "alt": "Alt 2", "caption": "Cap 2"},
+            ],
+        }
+        prompt = build_research_prompt(article)
+        self.assertIn("IMAGES IN THE SOURCE", prompt)
+        self.assertIn("[0] url=https://example.com/img1.jpg alt=Alt 1 caption=Cap 1", prompt)
+        self.assertIn("[1] url=https://example.com/img2.jpg alt=Alt 2 caption=Cap 2", prompt)
+
+    def test_prompt_omits_image_section_when_no_images(self):
+        article = {
+            "title": "Title",
+            "url": "https://example.com/test",
+            "blocks": [
+                {"type": "paragraph", "content": "Text 1"},
+            ],
+        }
+        prompt = build_research_prompt(article)
+        self.assertNotIn("IMAGES IN THE SOURCE", prompt)
+
+    def test_prompt_requires_image_alts_length(self):
+        article = {"title": "Title", "url": "https://example.com/test"}
+        prompt = build_research_prompt(article)
+        self.assertIn("length exactly equals", prompt)
+
+    def test_image_alts_normalized_to_short_list(self):
+        article = {
+            "title": "Title",
+            "url": "https://example.com/test",
+            "blocks": [
+                {"type": "image", "url": "https://example.com/img1.jpg"},
+                {"type": "image", "url": "https://example.com/img2.jpg"},
+            ],
+        }
+        mock_output = json.dumps({
+            "title": "T",
+            "summary": "S",
+            "body": "B",
+            "image_alts": ["Alt for img 1"],  # only 1 alt returned for 2 images
+        })
+        provider = NullProvider(response=mock_output)
+        result = research_article(article, provider)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result["images"]), 2)
+        self.assertEqual(result["images"][0]["alt_fa"], "Alt for img 1")
+        self.assertEqual(result["images"][1]["alt_fa"], "")
+
+    def test_image_alts_truncated_when_too_long(self):
+        article = {
+            "title": "Title",
+            "url": "https://example.com/test",
+            "blocks": [
+                {"type": "image", "url": "https://example.com/img1.jpg"},
+                {"type": "image", "url": "https://example.com/img2.jpg"},
+            ],
+        }
+        mock_output = json.dumps({
+            "title": "T",
+            "summary": "S",
+            "body": "B",
+            "image_alts": ["Alt 0", "Alt 1", "Alt 2", "Alt 3", "Alt 4"],
+        })
+        provider = NullProvider(response=mock_output)
+        result = research_article(article, provider)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result["images"]), 2)
+        self.assertEqual(result["images"][0]["alt_fa"], "Alt 0")
+        self.assertEqual(result["images"][1]["alt_fa"], "Alt 1")
+
+    def test_image_alts_mapped_by_block_order_not_image_index(self):
+        article = {
+            "title": "Title",
+            "url": "https://example.com/test",
+            "blocks": [
+                {"type": "paragraph", "content": "P1"},
+                {"type": "image", "url": "https://example.com/img_a.jpg"},
+                {"type": "paragraph", "content": "P2"},
+                {"type": "image", "url": "https://example.com/img_b.jpg"},
+            ],
+        }
+        mock_output = json.dumps({
+            "title": "T",
+            "summary": "S",
+            "body": "B",
+            "image_alts": ["A_alt", "B_alt"],
+        })
+        provider = NullProvider(response=mock_output)
+        result = research_article(article, provider)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result["images"]), 2)
+        self.assertEqual(result["images"][0]["url"], "https://example.com/img_a.jpg")
+        self.assertEqual(result["images"][0]["index"], 1)
+        self.assertEqual(result["images"][0]["alt_fa"], "A_alt")
+        self.assertEqual(result["images"][1]["url"], "https://example.com/img_b.jpg")
+        self.assertEqual(result["images"][1]["index"], 3)
+        self.assertEqual(result["images"][1]["alt_fa"], "B_alt")
+
+    def test_legacy_schema_still_passes(self):
+        article = {
+            "title": "Original English Title",
+            "url": "https://example.com/original-article",
+            "content": "English article body...",
+            "blocks": [
+                {"type": "paragraph", "content": "Text paragraph"},
+                {"type": "image", "url": "https://example.com/img1.jpg", "alt": "Old alt"},
+            ],
+        }
+        mock_json_res = json.dumps({
+            "title": "عنوان جدید فارسی",
+            "summary": "خلاصه خبر فارسی",
+            "body": "متن کامل مقاله جدید فارسی...",
+            "seo_description": "توضیحات سئو",
+            "keywords": ["گیم", "خبر"],
+            "research_notes": "نکات تحقیق",
+            "image_alts": ["توضیح عکس اول"],
+        }, ensure_ascii=False)
+
+        provider = NullProvider(response=mock_json_res)
+        result = research_article(article, provider)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["title"], "عنوان جدید فارسی")
+        self.assertEqual(result["images"][0]["alt_fa"], "توضیح عکس اول")
+        forbidden_keys = {"source_name", "source_url", "attribution", "copyright_notice", "credit", "original_title", "original_published"}
+        for fk in forbidden_keys:
+            self.assertNotIn(fk, result)
+
 
 if __name__ == "__main__":
     unittest.main()
