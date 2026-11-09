@@ -486,7 +486,7 @@ class TestArticleExtractor(unittest.TestCase):
     def test_normalize_image_url_strips_size_suffix(self):
         u1 = _normalize_image_url("https://cdn.example.com/ABC-1200-80.png")
         u2 = _normalize_image_url("https://cdn.example.com/ABC-1280-80.png")
-        self.assertEqual(u1, "https://cdn.example.com/ABC.png")
+        self.assertEqual(u1, "https://cdn.example.com/ABC")
         self.assertEqual(u1, u2)
 
         # Query param stripping
@@ -520,6 +520,54 @@ class TestArticleExtractor(unittest.TestCase):
         self.assertIsNotNone(data)
         img_blocks = [b for b in data["blocks"] if b["type"] == "image"]
         self.assertEqual(len(img_blocks), 7)
+
+    # --- Double Extension and Filename Preserving Tests ---
+    def test_normalize_image_url_double_extension(self):
+        a = _normalize_image_url("https://cdn.example.com/ABC-1200-80.png.webp")
+        b = _normalize_image_url("https://cdn.example.com/ABC-2560-80.png.webp")
+        self.assertEqual(a, b)
+        self.assertTrue(a.endswith("/ABC"), a)
+
+    def test_normalize_image_url_single_extension_still_works(self):
+        a = _normalize_image_url("https://cdn.example.com/XYZ-1920-80.jpg")
+        b = _normalize_image_url("https://cdn.example.com/XYZ-1200-80.jpg")
+        self.assertEqual(a, b)
+
+    def test_normalize_image_url_mixed_extensions(self):
+        # png vs png.webp — still same base
+        a = _normalize_image_url("https://cdn.example.com/Q-1200-80.png")
+        b = _normalize_image_url("https://cdn.example.com/Q-2560-80.png.webp")
+        self.assertEqual(a, b)
+
+    def test_normalize_image_url_does_not_break_real_filenames(self):
+        # A URL that ends in ".png" without a size suffix must be preserved
+        url = "https://cdn.example.com/hero.png"
+        self.assertEqual(_normalize_image_url(url), "https://cdn.example.com/hero.png")
+
+    def test_normalize_image_url_does_not_strip_numbers_without_two_dashes(self):
+        url = "https://cdn.example.com/ABC-1200.png"  # only one dash
+        self.assertEqual(_normalize_image_url(url), "https://cdn.example.com/ABC-1200.png")
+
+    def test_chess_style_srcset_collapsed(self):
+        # Synthetic HTML mimicking PC Gamer's srcset pattern with double extensions
+        html = """
+        <html><body><article>
+          <p>Introductory paragraph text explaining the game update and rule changes with enough length to meet thresholds.</p>
+          <img src="https://i.ytimg.com/vi/AAA/maxresdefault.jpg">
+          <p>Paragraph text between image blocks to provide proper structure for article extraction.</p>
+          <img src="https://cdn.example.com/S1-1200-80.png.webp">
+          <p>Paragraph text between image blocks to provide proper structure for article extraction.</p>
+          <img src="https://cdn.example.com/S1-2560-80.png.webp">
+          <p>Paragraph text between image blocks to provide proper structure for article extraction.</p>
+          <img src="https://cdn.example.com/S2-1200-80.png.webp">
+          <p>Paragraph text between image blocks to provide proper structure for article extraction.</p>
+          <img src="https://cdn.example.com/S2-2560-80.png.webp">
+        </article></body></html>
+        """
+        data = extract_article_data(html)
+        self.assertIsNotNone(data)
+        imgs = [b for b in data["blocks"] if b.get("type") == "image"]
+        self.assertEqual(len(imgs), 3, imgs)  # 1 youtube + 2 unique
 
 
 if __name__ == "__main__":

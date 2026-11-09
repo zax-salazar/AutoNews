@@ -250,48 +250,30 @@ def _resolve_image_url(img_tag: Tag) -> Optional[str]:
     return None
 
 
-SIZE_SUFFIX_PATTERN = re.compile(
-    r"-\d{2,5}-\d{1,3}\.(jpg|jpeg|png|webp|gif)$",
+_SIZE_SUFFIX_RE = re.compile(
+    r'-\d{2,5}-\d{1,3}(?:\.(?:jpe?g|png|webp|gif|avif|bmp))+$',
     re.IGNORECASE,
 )
 
 
 def _normalize_image_url(url: str) -> str:
-    """Strip size/quality variants for dedup purposes only.
-    - Remove trailing "-NNN-NN" segments before the file extension
-      (e.g. "-1200-80", "-1920-80", "-2342-80").
-    - Remove query strings of the form ?w=NNN, ?width=NNN, ?q=NN.
-    - Return the normalized URL. The ORIGINAL url is still used
-      for the block; this normalized form is only the dedup key.
-    """
+    """Strip size/quality variants for dedup purposes only."""
     if not url or not isinstance(url, str):
         return ""
-
-    url_str = url.strip()
     try:
-        parsed = urllib.parse.urlsplit(url_str)
+        parsed = urllib.parse.urlparse(url)
     except Exception:
-        return url_str.lower()
-
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
-    path = parsed.path
-
-    # Remove trailing suffix matching regex -\d{2,5}-\d{1,3}\.(jpg|jpeg|png|webp|gif)$ from path
-    match = SIZE_SUFFIX_PATTERN.search(path)
-    if match:
-        ext = match.group(1)
-        path = path[:match.start()] + "." + ext
-
-    # Strip query params w, width, q, quality
-    query_params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    filtered_query = [
-        (k, v) for k, v in query_params
-        if k.lower() not in ("w", "width", "q", "quality")
-    ]
-    new_query = urllib.parse.urlencode(filtered_query)
-
-    return urllib.parse.urlunsplit((scheme, netloc, path, new_query, ""))
+        return url
+    path = _SIZE_SUFFIX_RE.sub('', parsed.path)
+    # Drop tracking query params commonly used by CDNs
+    return urllib.parse.urlunparse((
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+        path,
+        '',  # params
+        '',  # query dropped
+        '',  # fragment dropped
+    ))
 
 
 IMAGE_NOISE_SUBSTRINGS = (
